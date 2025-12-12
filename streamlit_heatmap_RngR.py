@@ -35,14 +35,17 @@ Y_BINS = 80
 # 元画像座標（あなたのコードと同じ）
 home = (633.0, 1071.0)
 ray_origin = (633.0, 428.0)
+ray_origin_near = (633.0, 737.0)
 left_pt = (240.0, 682.0)
+left_pt_near = (466.0, 904.0)
 right_pt = (1033.0, 682.0)
+right_pt_near = (800.0, 904.0)
 
 # 初期守備位置（画像座標：y下向き）
 infield_positions_img = {
     "1B": (869, 741),
-    "2B": (742, 577),
-    "SS": (526, 577),
+    "2B": (742, 600),
+    "SS": (526, 600),
     "3B": (397, 741),
     "LF": (313, 414),
     "CF": (633, 296),
@@ -50,7 +53,7 @@ infield_positions_img = {
 }
 
 # 回転（反時計回り＋）
-ROT_DEG = {"SS": +30, "3B": +30, "2B": -30, "1B": -30}
+ROT_DEG = {"SS": +35, "3B": +35, "2B": -35, "1B": -35}
 
 
 # ------------------- helper -------------------
@@ -114,7 +117,7 @@ def load_ellipse_tables():
     tables = {}
     for pos, path in ELLIPSE_CSV_PATHS.items():
         d = read_csv_flexible(path).copy()
-        for c in ["center", "major-axis", "minor-axis"]:
+        for c in ["center_x", "center_y", "major-axis", "minor-axis"]:
             if c in d.columns:
                 d[c] = pd.to_numeric(d[c], errors="coerce")
         tables[pos] = d
@@ -151,6 +154,51 @@ def build_heatmap(df_filtered, img, w_img, h_img, use_projection=True):
     df_ground = df_ground[
         df_ground["angle_deg"].between(a_min, a_max, inclusive="both")
     ].copy()
+    if len(df_ground) == 0:
+        return None
+
+        # ------------------- ホーム側ゴロの除外（第2境界線） -------------------
+    v_left_near = (
+        left_pt_near[0] - ray_origin_near[0],
+        left_pt_near[1] - ray_origin_near[1],
+    )
+    v_right_near = (
+        right_pt_near[0] - ray_origin_near[0],
+        right_pt_near[1] - ray_origin_near[1],
+    )
+
+    keep_mask = []
+
+    for _, row in df_ground.iterrows():
+        x = row["x_coord_img"]
+        y = row["y_coord_img"]
+
+        if not np.isfinite(x) or not np.isfinite(y):
+            keep_mask.append(False)
+            continue
+
+        theta = row["angle_deg"]
+        v_home = dir_vector_from_home_angle(theta)
+
+        # 左右どちらの境界を使うか
+        v_bound = v_left_near if x <= ray_origin_near[0] else v_right_near
+
+        inter = intersect_lines(home, v_home, ray_origin_near, v_bound)
+
+        if inter is None:
+            keep_mask.append(False)
+            continue
+
+        ix, iy = inter
+
+        d_ball = math.hypot(x - home[0], y - home[1])
+        d_inter = math.hypot(ix - home[0], iy - home[1])
+
+        # ★ 境界線より「奥」にある打球だけ残す
+        keep_mask.append(d_ball >= d_inter)
+
+    df_ground = df_ground[np.array(keep_mask)].copy()
+
     if len(df_ground) == 0:
         return None
 
@@ -231,12 +279,13 @@ def add_ellipse(ax, pos, row, h_img):
     angle = ROT_DEG[pos]
 
     name = str(row["NAME"])
-    x_shift = float(row["center"])
+    dx = float(row["center_x"])
+    dy = float(row["center_y"])
     a = float(row["major-axis"])
     b = float(row["minor-axis"])
 
-    cx_img = base_x_img + x_shift
-    cy_img = base_y_img
+    cx_img = base_x_img + dx
+    cy_img = base_y_img + dy
 
     cx = cx_img
     cy = h_img - cy_img
@@ -336,7 +385,7 @@ else:
     ax.imshow(img_flipped, extent=[0, w_img, 0, h_img], origin="lower")
 
     # ヒートマップ
-    cmap = plt.cm.get_cmap("inferno", 512)
+    cmap = plt.cm.get_cmap("inferno", 1024)
     hm = ax.imshow(
         counts_masked.T,
         origin="lower",
