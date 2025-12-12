@@ -11,15 +11,20 @@ from matplotlib.patches import Ellipse
 # =========================
 # パス設定（要変更）
 # =========================
-CSV_PATH = r"C:\Users\akaok\OneDrive\デスクトップ\baseball_ml\hittingdata.csv"
-IMAGE_PATH = r"C:\Users\akaok\OneDrive\デスクトップ\baseball_ml\baseballfield.jpg"
+# --- CSVファイルの相対パス ---
+CSV_PATH = "hittingdata.csv"
 
+# --- 画像の相対パス ---
+IMAGE_PATH = "baseballfield.jpg"
+
+# --- 守備位置ごとの CSV ---
 ELLIPSE_CSV_PATHS = {
-    "SS": r"C:\Users\akaok\OneDrive\デスクトップ\baseball_ml\SAO-RBB(SS).csv",
-    "2B": r"C:\Users\akaok\OneDrive\デスクトップ\baseball_ml\SAO-RBB(2B).csv",
-    "3B": r"C:\Users\akaok\OneDrive\デスクトップ\baseball_ml\SAO-RBB(3B).csv",
-    "1B": r"C:\Users\akaok\OneDrive\デスクトップ\baseball_ml\SAO-RBB(1B).csv",
+    "SS": "SAO-RBB(SS).csv",
+    "2B": "SAO-RBB(2B).csv",
+    "3B": "SAO-RBB(3B).csv",
+    "1B": "SAO-RBB(1B).csv",
 }
+
 
 # Streamlit側クリック画像サイズ
 REC_WIDTH, REC_HEIGHT = 750, 750
