@@ -30,8 +30,8 @@ ELLIPSE_CSV_PATHS = {
 REC_WIDTH, REC_HEIGHT = 750, 750
 
 # ヒストグラム
-X_BINS = 100
-Y_BINS = 100
+X_BINS = 80
+Y_BINS = 80
 
 # 元画像座標（あなたのコードと同じ）
 home = (633.0, 1071.0)
@@ -97,7 +97,13 @@ def load_main_data():
     # df = df[df["pitchername"] != "なし"]
 
     # フィルタ列も全部文字列化（値の揺れ対策）
-    for c in ["pitch_course", "pitch_height", "pitch_type", "player_batLR"]:
+    for c in [
+        "opponents",
+        "pitch_course",
+        "pitch_height",
+        "pitch_type",
+        "player_batLR",
+    ]:
         if c in df.columns:
             df[c] = df[c].astype(str)
 
@@ -202,7 +208,7 @@ def build_heatmap(df_filtered, img, w_img, h_img):
     non_zero = counts_masked[~np.isnan(counts_masked)]
     if non_zero.size > 0:
         low_p = 10
-        high_p = 70
+        high_p = 99.5
         vmin = np.percentile(non_zero, low_p)
         vmax = np.percentile(non_zero, high_p)
         counts_masked[counts_masked < vmin] = np.nan
@@ -266,6 +272,7 @@ def multiselect_filter(label, col):
     return st.multiselect(label, options=values, default=[])
 
 
+sel_opponents = multiselect_filter("対戦相手", "opponents")
 sel_course = multiselect_filter("pitch_course（コース）", "pitch_course")
 sel_height = multiselect_filter("pitch_height（高さ）", "pitch_height")
 sel_type = multiselect_filter("pitch_type（球種）", "pitch_type")
@@ -285,6 +292,8 @@ for pos in ["SS", "2B", "3B", "1B"]:
 # フィルタ適用
 # =========================
 df_f = df_p.copy()
+if sel_opponents:
+    df_f = df_f[df_f["opponents"].astype(str).isin(sel_opponents)]
 if sel_course:
     df_f = df_f[df_f["pitch_course"].astype(str).isin(sel_course)]
 if sel_height:
