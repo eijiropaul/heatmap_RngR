@@ -283,7 +283,7 @@ sel_lr = multiselect_filter("player_batLR（打者左右）", "player_batLR")
 
 # ★ 追加：投影ON/OFF
 use_projection = st.checkbox(
-    "境界線への投影を使う（深いゴロを境界線に落とし込む）", value=True
+    "境界線への投影を使う（深いゴロを境界線に落とし込む）", value=False
 )
 
 # 守備範囲（選手）
