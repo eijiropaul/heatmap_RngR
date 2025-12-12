@@ -126,6 +126,22 @@ def load_main_data():
         if c in df.columns:
             df[c] = df[c].astype(str)
 
+    # =========================
+    # ★ pitch_type を3分類にまとめる
+    # =========================
+    def map_pitch_group(pt: str) -> str:
+        pt = str(pt).strip()
+        if pt in ["ストレート", "ツーシーム"]:
+            return "ストレート系"
+        elif pt in ["カーブ", "スライダー", "カットボール"]:
+            return "スライダー系"
+        elif pt in ["チェンジアップ", "フォーク"]:
+            return "フォーク系"
+        else:
+            return "その他"
+
+    df["pitch_type_group"] = df["pitch_type"].apply(map_pitch_group)
+
     return df
 
 
@@ -139,6 +155,176 @@ def load_ellipse_tables():
                 d[c] = pd.to_numeric(d[c], errors="coerce")
         tables[pos] = d
     return tables
+
+
+def to_polar_from_home(df_ground, home_math):
+    dx = df_ground["x_math"].to_numpy(float) - home_math[0]
+    dy = df_ground["y_math"].to_numpy(float) - home_math[1]
+    theta = np.arctan2(dy, dx)  # -pi..pi
+    r = np.hypot(dx, dy)
+    return theta, r
+
+
+def fit_conditional_hist(
+    df_ground, home_math, feat_cols, n_theta=36, n_r=18, r_max=None, laplace=1.0
+):
+    """
+    条件キー(カテゴリの結合)ごとに (theta,r) の2Dヒストを作る
+    laplace>0 でスムージングして疎データでも破綻しにくくする
+    """
+    theta, r = to_polar_from_home(df_ground, home_math)
+
+    if r_max is None:
+        r_max = np.percentile(r, 99.5)
+        r_max = max(r_max, 1.0)
+
+    theta_edges = np.linspace(-np.pi, np.pi, n_theta + 1)
+    r_edges = np.linspace(0, r_max, n_r + 1)
+
+    keys = df_ground[feat_cols].astype(str).agg("|".join, axis=1).to_numpy()
+
+    model = {
+        "feat_cols": feat_cols,
+        "theta_edges": theta_edges,
+        "r_edges": r_edges,
+        "tables": {},
+        "counts": {},
+        "r_max": r_max,
+        "laplace": laplace,
+    }
+
+    # 全体（バックオフ用）
+    H_all, _, _ = np.histogram2d(theta, r, bins=[theta_edges, r_edges])
+    model["tables"]["__ALL__"] = H_all + laplace
+    model["counts"]["__ALL__"] = int(len(df_ground))
+
+    for k in np.unique(keys):
+        m = keys == k
+        if m.sum() < 2:
+            continue
+        H, _, _ = np.histogram2d(theta[m], r[m], bins=[theta_edges, r_edges])
+        model["tables"][k] = H + laplace
+        model["counts"][k] = int(m.sum())
+
+    return model
+
+
+def _sample_from_hist(H, theta_edges, r_edges, n_samples, rng):
+    P = H / H.sum()
+    idx = rng.choice(P.size, size=n_samples, p=P.ravel())
+
+    it = idx // (len(r_edges) - 1)
+    ir = idx % (len(r_edges) - 1)
+
+    th0 = theta_edges[it]
+    th1 = theta_edges[it + 1]
+    rr0 = r_edges[ir]
+    rr1 = r_edges[ir + 1]
+
+    theta = rng.uniform(th0, th1)
+    r = rng.uniform(rr0, rr1)
+    return theta, r
+
+
+def build_training_ground(df_all, w_img, h_img, use_projection_for_train=False):
+    """
+    フェーズ3用：
+    全データからゴロのみ抽出し、(x_math,y_math,条件列)を返す
+    """
+    scale_x = w_img / REC_WIDTH
+    scale_y = h_img / REC_HEIGHT
+
+    df = df_all.copy()
+    df["x_click"] = pd.to_numeric(df["x_coord"], errors="coerce")
+    df["y_click"] = pd.to_numeric(df["y_coord"], errors="coerce")
+    df["x_img"] = df["x_click"] * scale_x
+    df["y_img"] = df["y_click"] * scale_y
+
+    # ゴロのみ
+    df = df[df["hit_type"].str.contains("ゴロ", na=False)].copy()
+    if len(df) == 0:
+        return None
+
+    # math座標
+    df["x_math"] = df["x_img"]
+    df["y_math"] = h_img - df["y_img"]
+
+    return df
+
+
+def xy_to_theta_r(xs, ys, home_math):
+    dx = xs - home_math[0]
+    dy = ys - home_math[1]
+    theta = np.arctan2(dy, dx)  # [-π,π]
+    r = np.hypot(dx, dy)
+    return theta, r
+
+
+def fit_conditional_hist(
+    df_ground,
+    home_math,
+    feat_cols,
+    n_theta=36,
+    n_r=18,
+    laplace=1.0,
+):
+    """
+    条件 → (theta,r) 分布 を学習
+    """
+    model = {}
+
+    xs = df_ground["x_math"].to_numpy()
+    ys = df_ground["y_math"].to_numpy()
+    theta, r = xy_to_theta_r(xs, ys, home_math)
+
+    df = df_ground.copy()
+    df["_theta"] = theta
+    df["_r"] = r
+
+    for key, g in df.groupby(feat_cols):
+        th = g["_theta"].to_numpy()
+        rr = g["_r"].to_numpy()
+
+        H, th_edges, r_edges = np.histogram2d(
+            th,
+            rr,
+            bins=[n_theta, n_r],
+            range=[[-np.pi, np.pi], [0, np.max(r)]],
+        )
+
+        # Laplace smoothing
+        H = H + laplace
+        H = H / H.sum()
+
+        model[key] = {
+            "H": H,
+            "th_edges": th_edges,
+            "r_edges": r_edges,
+        }
+
+    return model
+
+
+def sample_from_hist(model, cond_tuple, n_samples, home_math, rng):
+    if cond_tuple not in model:
+        return None
+
+    H = model[cond_tuple]["H"]
+    th_edges = model[cond_tuple]["th_edges"]
+    r_edges = model[cond_tuple]["r_edges"]
+
+    flat = H.flatten()
+    idx = rng.choice(len(flat), size=n_samples, p=flat)
+
+    it, ir = np.unravel_index(idx, H.shape)
+
+    th = rng.uniform(th_edges[it], th_edges[it + 1])
+    rr = rng.uniform(r_edges[ir], r_edges[ir + 1])
+
+    x = home_math[0] + rr * np.cos(th)
+    y = home_math[1] + rr * np.sin(th)
+
+    return x, y
 
 
 def build_heatmap(df_filtered, img, w_img, h_img, use_projection=True):
@@ -291,6 +477,100 @@ def build_heatmap(df_filtered, img, w_img, h_img, use_projection=True):
     return counts_masked, xedges, yedges, norm, len(df_ground), df_ground
 
 
+def fit_conditional_hist(
+    df_ground,
+    home_math,
+    feat_cols,
+    n_theta=36,
+    n_r=18,
+    laplace=1.0,
+):
+    """
+    条件→(theta,r) 2Dヒストを作る。
+    __ALL__ を必ず作り、キーが無いときはそこへバックオフ。
+    """
+    xs = df_ground["x_math"].to_numpy(float)
+    ys = df_ground["y_math"].to_numpy(float)
+    theta, r = xy_to_theta_r(xs, ys, home_math)
+
+    r_max = np.percentile(r, 99.5)
+    r_max = max(r_max, 1.0)
+
+    th_edges = np.linspace(-np.pi, np.pi, n_theta + 1)
+    r_edges = np.linspace(0, r_max, n_r + 1)
+
+    model = {
+        "feat_cols": feat_cols,
+        "th_edges": th_edges,
+        "r_edges": r_edges,
+        "tables": {},
+    }
+
+    # ---- 全体（バックオフ） ----
+    H_all, _, _ = np.histogram2d(theta, r, bins=[th_edges, r_edges])
+    H_all = H_all + laplace
+    model["tables"]["__ALL__"] = H_all / H_all.sum()
+
+    # ---- 条件ごと ----
+    keys = df_ground[feat_cols].astype(str).agg("|".join, axis=1).to_numpy()
+    for k in np.unique(keys):
+        m = keys == k
+        if m.sum() < 2:
+            continue
+        H, _, _ = np.histogram2d(theta[m], r[m], bins=[th_edges, r_edges])
+        H = H + laplace
+        model["tables"][k] = H / H.sum()
+
+    return model
+
+
+def pick_one_or_blank(sel_list):
+    # 未選択→""（バックオフ方向）
+    if not sel_list:
+        return ""
+    # 複数なら先頭1つ（まずはこれでOK）
+    return str(sel_list[0])
+
+
+def generate_ground_xy_from_model(model, cond_dict, home_math, n_samples, seed=0):
+    feat_cols = model["feat_cols"]
+    key = "|".join([str(cond_dict.get(c, "")) for c in feat_cols])
+
+    H = model["tables"].get(key, model["tables"]["__ALL__"])
+    th_edges = model["th_edges"]
+    r_edges = model["r_edges"]
+
+    rng = np.random.default_rng(int(seed))
+
+    flat = H.ravel()
+    idx = rng.choice(flat.size, size=n_samples, p=flat)
+
+    it = idx // (len(r_edges) - 1)
+    ir = idx % (len(r_edges) - 1)
+
+    th0 = th_edges[it]
+    th1 = th_edges[it + 1]
+    rr0 = r_edges[ir]
+    rr1 = r_edges[ir + 1]
+
+    theta = rng.uniform(th0, th1)
+    rr = rng.uniform(rr0, rr1)
+
+    x = home_math[0] + rr * np.cos(theta)
+    y = home_math[1] + rr * np.sin(theta)
+
+    return x, y, key
+
+
+def out_rate_weighted_mask(out_mask: np.ndarray, ws: np.ndarray) -> float:
+    # out_mask: bool配列（楕円に入った=アウト想定）
+    # ws: 重み
+    denom = ws.sum()
+    if denom <= 0:
+        return np.nan
+    return (ws * out_mask.astype(float)).sum() / denom
+
+
 def add_ellipse(ax, pos, row, h_img, dx_extra=0.0, dy_extra=0.0, **style):
     base_x_img, base_y_img = infield_positions_img[pos]
     angle = ROT_DEG[pos]
@@ -346,6 +626,269 @@ def ellipse_mask_from_uv(u, v, a, b, du=0.0, dv=0.0):
     uu = (u - du) / a
     vv = (v - dv) / b
     return (uu * uu + vv * vv) <= 1.0
+
+
+def angle_deg_from_home_math(x, y, home_math):
+    dx = x - home_math[0]
+    dy = y - home_math[1]
+    return math.degrees(math.atan2(dy, dx))
+
+
+def generate_ground_xy_filtered(
+    model,
+    cond_dict,
+    home_math,
+    n_samples,
+    seed,
+    w_img,
+    h_img,
+    left_pt_math,
+    right_pt_math,
+    ray_origin_near_math,
+    left_pt_near_math,
+    right_pt_near_math,
+    oversample=4,
+    max_rounds=10,
+):
+    """
+    生成→除外条件で落とす→必要数に満たなければ追加生成、のラッパー
+    """
+    need = int(n_samples)
+    if need <= 0:
+        return None, None, None
+
+    xs, ys = [], []
+    used_key_final = None
+
+    for r in range(max_rounds):
+        n_try = max(need * oversample, 50)
+
+        xg, yg, used_key = generate_ground_xy_from_model(
+            model, cond_dict, home_math, n_samples=n_try, seed=int(seed) + r
+        )
+
+
+def project_points_img(xs_img, ys_img, home, ray_origin, left_pt, right_pt):
+    """
+    画像座標(y下)の点群を、あなたのロジックで境界線へ投影して返す
+    xs_img, ys_img: 1D numpy array
+    return: (xp_img, yp_img)
+    """
+    xs_img = np.asarray(xs_img, dtype=float)
+    ys_img = np.asarray(ys_img, dtype=float)
+
+    v_left = (left_pt[0] - ray_origin[0], left_pt[1] - ray_origin[1])
+    v_right = (right_pt[0] - ray_origin[0], right_pt[1] - ray_origin[1])
+
+    xp = xs_img.copy()
+    yp = ys_img.copy()
+
+    for i in range(xs_img.size):
+        x = xs_img[i]
+        y = ys_img[i]
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+
+        # ホーム→打球方向の角度（画像座標）
+        theta = angle_from_home_deg(x, y, home_x=home[0], home_y=home[1])
+        v_home = dir_vector_from_home_angle(theta)
+
+        v_bound = v_left if x <= ray_origin[0] else v_right
+        inter = intersect_lines(home, v_home, ray_origin, v_bound)
+        if inter is None:
+            continue
+
+        ix, iy = inter
+        d_ball = math.hypot(x - home[0], y - home[1])
+        d_inter = math.hypot(ix - home[0], iy - home[1])
+
+        # 境界より外（深い）なら交点へ投影
+        if d_ball > d_inter:
+            xp[i] = ix
+            yp[i] = iy
+
+    return xp, yp
+
+
+def project_points_math(xs_math, ys_math, h_img, home, ray_origin, left_pt, right_pt):
+    """
+    math座標(y上) → img座標(y下)に戻して投影 → mathに戻す
+    """
+    xs_math = np.asarray(xs_math, dtype=float)
+    ys_math = np.asarray(ys_math, dtype=float)
+
+    xs_img = xs_math
+    ys_img = h_img - ys_math
+
+    xp_img, yp_img = project_points_img(
+        xs_img, ys_img, home, ray_origin, left_pt, right_pt
+    )
+
+    xp_math = xp_img
+    yp_math = h_img - yp_img
+    return xp_math, yp_math
+
+
+def filter_generated_points(
+    xg,
+    yg,
+    home_math,
+    w_img,
+    h_img,
+    left_pt_math,
+    right_pt_math,
+    ray_origin_near_math,
+    left_pt_near_math,
+    right_pt_near_math,
+):
+    xg = np.asarray(xg, dtype=float)
+    yg = np.asarray(yg, dtype=float)
+
+    # ①画面外除外
+    mask = (xg >= 0) & (xg <= w_img) & (yg >= 0) & (yg <= h_img)
+
+    # ②ファウル除外（角度）
+    ang_left = angle_deg_from_home_math(left_pt_math[0], left_pt_math[1], home_math)
+    ang_right = angle_deg_from_home_math(right_pt_math[0], right_pt_math[1], home_math)
+    a_min, a_max = (min(ang_left, ang_right), max(ang_left, ang_right))
+
+    ang = np.array([angle_deg_from_home_math(x, y, home_math) for x, y in zip(xg, yg)])
+    mask &= (ang >= a_min) & (ang <= a_max)
+
+    # ③ホーム寄り（第2境界線より手前）を除外
+    v_left_near = (
+        left_pt_near_math[0] - ray_origin_near_math[0],
+        left_pt_near_math[1] - ray_origin_near_math[1],
+    )
+    v_right_near = (
+        right_pt_near_math[0] - ray_origin_near_math[0],
+        right_pt_near_math[1] - ray_origin_near_math[1],
+    )
+
+    keep2 = np.zeros_like(mask, dtype=bool)
+
+    for i in range(len(xg)):
+        if not mask[i]:
+            continue
+
+        x, y = xg[i], yg[i]
+
+        dx = x - home_math[0]
+        dy = y - home_math[1]
+        d_ball = math.hypot(dx, dy)
+        if d_ball <= 0:
+            continue
+
+        v_home = (dx / d_ball, dy / d_ball)
+        v_bound = v_left_near if x <= ray_origin_near_math[0] else v_right_near
+
+        inter = intersect_lines(home_math, v_home, ray_origin_near_math, v_bound)
+        if inter is None:
+            continue
+
+        ix, iy = inter
+        d_inter = math.hypot(ix - home_math[0], iy - home_math[1])
+
+        keep2[i] = d_ball >= d_inter
+
+    mask &= keep2
+    return mask
+
+
+def generate_ground_xy_filtered(
+    model,
+    cond_dict,
+    home_math,
+    n_samples,
+    seed,
+    w_img,
+    h_img,
+    left_pt_math,
+    right_pt_math,
+    ray_origin_near_math,
+    left_pt_near_math,
+    right_pt_near_math,
+    oversample=4,
+    max_rounds=10,
+    use_projection=False,
+    h_img_for_projection=None,
+    home_img=None,
+    ray_origin_img=None,
+    left_pt_img=None,
+    right_pt_img=None,
+):
+    """
+    生成→除外条件で落とす→必要数に満たなければ追加生成
+    ※use_projection=Trueなら最後に生成点も境界線へ投影する
+    """
+    need = int(n_samples)
+    if need <= 0:
+        return None, None, None
+
+    xs_list, ys_list = [], []
+    used_key_final = None
+
+    for r in range(max_rounds):
+        n_try = max(need * oversample, 50)
+
+        xg, yg, used_key = generate_ground_xy_from_model(
+            model, cond_dict, home_math, n_samples=n_try, seed=int(seed) + r
+        )
+        used_key_final = used_key
+
+        # まずフィルタで落とす（投影前座標で）
+        m = filter_generated_points(
+            xg,
+            yg,
+            home_math,
+            w_img,
+            h_img,
+            left_pt_math,
+            right_pt_math,
+            ray_origin_near_math,
+            left_pt_near_math,
+            right_pt_near_math,
+        )
+
+        xk = np.asarray(xg)[m]
+        yk = np.asarray(yg)[m]
+
+        if xk.size == 0:
+            continue
+
+        # ★必要ならここで投影（フィルタ通過後にやるのが効率良い）
+        if use_projection:
+            if h_img_for_projection is None:
+                raise ValueError(
+                    "use_projection=True なのに h_img_for_projection が None です"
+                )
+            if None in (home_img, ray_origin_img, left_pt_img, right_pt_img):
+                raise ValueError(
+                    "use_projection=True なのに画像座標の境界パラメータが不足しています"
+                )
+
+            xk, yk = project_points_math(
+                xk,
+                yk,
+                h_img_for_projection,
+                home_img,
+                ray_origin_img,
+                left_pt_img,
+                right_pt_img,
+            )
+
+        take = min(xk.size, need)
+        xs_list.append(xk[:take])
+        ys_list.append(yk[:take])
+        need -= take
+
+        if need <= 0:
+            break
+
+    if len(xs_list) == 0:
+        return None, None, used_key_final
+
+    return np.concatenate(xs_list), np.concatenate(ys_list), used_key_final
 
 
 def make_ellipse_params(pos, row, h_img, dx_extra=0.0, dy_extra=0.0):
@@ -445,6 +988,37 @@ def out_rate_from_points(xs, ys, ellipse_list):
     return out_mask.mean()
 
 
+@st.cache_data
+def build_training_ground(df_all, w_img, h_img, use_projection_for_train=False):
+    out = build_heatmap(
+        df_all, None, w_img, h_img, use_projection=use_projection_for_train
+    )
+    if out is None:
+        return None
+    *_, df_ground_all = out
+    return df_ground_all
+
+
+def out_rate_weighted(xs, ys, ws, ellipse_list):
+    if xs.size == 0:
+        return np.nan
+    out_mask = np.zeros(xs.shape[0], dtype=bool)
+
+    for e in ellipse_list:
+        cx, cy, a, b, th = e["cx"], e["cy"], e["a"], e["b"], e["theta"]
+        th = np.deg2rad(th)
+        c, s = np.cos(th), np.sin(th)
+
+        dx = xs - cx
+        dy = ys - cy
+        u = c * dx + s * dy
+        v = -s * dx + c * dy
+        inside = (u / a) ** 2 + (v / b) ** 2 <= 1.0
+        out_mask |= inside
+
+    return (ws * out_mask.astype(float)).sum() / ws.sum()
+
+
 # =========================
 # UI
 # =========================
@@ -475,7 +1049,11 @@ def multiselect_filter(label, col):
 sel_opponents = multiselect_filter("対戦相手", "opponents")
 sel_course = multiselect_filter("pitch_course（コース）", "pitch_course")
 sel_height = multiselect_filter("pitch_height（高さ）", "pitch_height")
-sel_type = multiselect_filter("pitch_type（球種）", "pitch_type")
+sel_type_group = st.multiselect(
+    "pitch_type（球種グループ）",
+    options=["ストレート系", "スライダー系", "フォーク系"],
+    default=[],
+)
 sel_lr = multiselect_filter("player_batLR（打者左右）", "player_batLR")
 
 # ★ 追加：投影ON/OFF
@@ -503,8 +1081,8 @@ if sel_course:
     df_f = df_f[df_f["pitch_course"].astype(str).isin(sel_course)]
 if sel_height:
     df_f = df_f[df_f["pitch_height"].astype(str).isin(sel_height)]
-if sel_type:
-    df_f = df_f[df_f["pitch_type"].astype(str).isin(sel_type)]
+if sel_type_group:
+    df_f = df_f[df_f["pitch_type_group"].isin(sel_type_group)]
 if sel_lr:
     df_f = df_f[df_f["player_batLR"].astype(str).isin(sel_lr)]
 
@@ -521,6 +1099,51 @@ img = mpimg.imread(IMAGE_PATH)
 h_img, w_img = img.shape[0], img.shape[1]
 img_flipped = np.flipud(img)
 
+# --- home / 境界点を math 座標へ（origin="lower" 描画に合わせる） ---
+home_math = (home[0], h_img - home[1])
+
+left_pt_math = (left_pt[0], h_img - left_pt[1])
+right_pt_math = (right_pt[0], h_img - right_pt[1])
+
+ray_origin_near_math = (ray_origin_near[0], h_img - ray_origin_near[1])
+left_pt_near_math = (left_pt_near[0], h_img - left_pt_near[1])
+right_pt_near_math = (right_pt_near[0], h_img - right_pt_near[1])
+
+home_math = (home[0], h_img - home[1])  # homeは画像座標(y下)なのでmathに変換
+
+# =========================
+# フェーズ3：条件付き分布モデル（学習）
+# =========================
+use_ai = st.checkbox("AI生成ゴロでデータ不足を補完（フェーズ3）", value=False)
+
+n_gen = st.slider("生成するゴロ点数（不足分の目安）", 0, 500, 150, 25)
+gen_weight = st.slider("生成点の重み（実測=1.0）", 0.1, 1.0, 0.3, 0.05)
+gen_seed = st.number_input("生成seed（再現用）", value=0, step=1)
+
+# 学習に使う特徴量（ここが重要：pitch_type_group を使う）
+feat_cols = [
+    "opponents",
+    "pitch_course",
+    "pitch_height",
+    "pitch_type_group",
+    "player_batLR",
+]
+
+df_ground_train = build_training_ground(
+    df, w_img, h_img, use_projection_for_train=False
+)
+
+model = None
+if use_ai and (df_ground_train is not None) and (len(df_ground_train) > 0):
+    model = fit_conditional_hist(
+        df_ground_train,
+        home_math=home_math,
+        feat_cols=feat_cols,
+        n_theta=36,
+        n_r=18,
+        laplace=1.0,
+    )
+
 res = build_heatmap(df_f, img, w_img, h_img, use_projection=use_projection)
 
 if res is None:
@@ -530,9 +1153,79 @@ else:
     opt_delta = None
     opt_best_out = None
     counts_masked, xedges, yedges, norm, n_ground, df_ground = res
+
+    # =========================
+    # フェーズ3：生成点を評価に混ぜる（重み付き）
+    # （※このブロックは1回だけ置く）
+    # =========================
+    xs_obs = df_ground["x_math"].to_numpy(float)
+    ys_obs = df_ground["y_math"].to_numpy(float)
+    ws_obs = np.ones(xs_obs.size, dtype=float)
+
+    xs_all = xs_obs
+    ys_all = ys_obs
+    ws_all = ws_obs
+
+    used_key = None
+
+    if use_ai and (model is not None) and (n_gen > 0):
+        cond_dict = {
+            "opponents": pick_one_or_blank(sel_opponents),  # "京大"/"京大以外"
+            "pitch_course": pick_one_or_blank(sel_course),
+            "pitch_height": pick_one_or_blank(sel_height),
+            "pitch_type_group": pick_one_or_blank(sel_type_group),
+            "player_batLR": pick_one_or_blank(sel_lr),
+        }
+
+        xg, yg, used_key = generate_ground_xy_filtered(
+            model=model,
+            cond_dict=cond_dict,
+            home_math=home_math,
+            n_samples=n_gen,
+            seed=gen_seed,
+            w_img=w_img,
+            h_img=h_img,
+            left_pt_math=(left_pt[0], h_img - left_pt[1]),
+            right_pt_math=(right_pt[0], h_img - right_pt[1]),
+            ray_origin_near_math=(ray_origin_near[0], h_img - ray_origin_near[1]),
+            left_pt_near_math=(left_pt_near[0], h_img - left_pt_near[1]),
+            right_pt_near_math=(right_pt_near[0], h_img - right_pt_near[1]),
+            oversample=4,
+            max_rounds=10,
+            # 投影を使うならここもON
+            use_projection=use_projection,
+            h_img_for_projection=h_img,
+            home_img=home,
+            ray_origin_img=ray_origin,
+            left_pt_img=left_pt,
+            right_pt_img=right_pt,
+        )
+
+        if xg is None:
+            st.warning(
+                "AI生成点が除外条件（ファール/ホーム寄り境界）で全て落ちました。条件を緩めるか n_gen を下げてください。"
+            )
+        else:
+            # ここから先は今まで通り（xs_allにconcat、scatter表示など）
+            ...
+
+        gw = float(gen_weight)
+        xs_all = np.concatenate([xs_obs, xg])
+        ys_all = np.concatenate([ys_obs, yg])
+        ws_all = np.concatenate([ws_obs, np.full(n_gen, gw, dtype=float)])
+
+        st.caption(
+            f"AI生成点 {n_gen}点（重み={gw}）を追加 / key='{used_key if used_key else 'N/A'}'"
+        )
     st.caption(f"ヒートマップに使ったゴロ数：{n_ground}")
 
     fig, ax = plt.subplots(figsize=(6, 8))
+
+    show_gen_points = st.checkbox(
+        "AI生成点をヒートマップに重ねる（薄く表示）", value=True
+    )
+    gen_point_alpha = st.slider("生成点の透明度", 0.01, 0.5, 0.08, 0.01)
+    gen_point_size = st.slider("生成点の大きさ", 1, 20, 6, 1)
 
     # 背景
     ax.imshow(img_flipped, extent=[0, w_img, 0, h_img], origin="lower")
@@ -548,6 +1241,43 @@ else:
         alpha=0.6,
     )
     fig.colorbar(hm, ax=ax, label="Hit density (log scale)")
+
+    # =========================
+    # AI生成点をヒートマップに重ねる（薄い点）
+    # =========================
+    if show_gen_points and use_ai and (model is not None) and (n_gen > 0):
+        # 生成点がこのスコープに無い場合に備えて安全に取得
+        if (
+            "xg" in locals()
+            and "yg" in locals()
+            and (xg is not None)
+            and (yg is not None)
+        ):
+            x_plot_gen = xg
+            y_plot_gen = yg
+        else:
+            # 万一 xg/yg を消してしまった場合の保険：ここで再生成
+            cond_dict = {
+                "opponents": pick_one_or_blank(sel_opponents),
+                "pitch_course": pick_one_or_blank(sel_course),
+                "pitch_height": pick_one_or_blank(sel_height),
+                "pitch_type_group": pick_one_or_blank(sel_type_group),
+                "player_batLR": pick_one_or_blank(sel_lr),
+            }
+            x_plot_gen, y_plot_gen, _ = generate_ground_xy_from_model(
+                model, cond_dict, home_math, n_samples=n_gen, seed=gen_seed
+            )
+
+        ax.scatter(
+            x_plot_gen,
+            y_plot_gen,
+            s=gen_point_size,
+            alpha=gen_point_alpha,
+            marker="o",
+            linewidths=0,
+            rasterized=True,  # ★軽くなる（重要）
+            label="AI generated",
+        )
 
     # 守備位置（参考点）
     for name, (px, py_img) in infield_positions_img.items():
@@ -582,7 +1312,30 @@ else:
         rows_by_pos[pos] = row
         ellipse_params_normal.append(make_ellipse_params(pos, row, h_img))
 
-    out_normal = calc_out_rate(df_ground, ellipse_params_normal)
+    # =========================
+    # 通常守備 Out%（重み付き）
+    # =========================
+    # ---------------------------
+    # データ点（math座標）
+    # ---------------------------
+    # ここを生成込みに差し替え
+    xs = xs_all
+    ys = ys_all
+    ws = ws_all
+    n = len(xs)
+    sum_w = ws.sum()
+    normal_mask = np.zeros(n, dtype=bool)
+
+    for pos in ["1B", "2B", "3B", "SS"]:
+        if pos not in rows_by_pos:
+            continue
+        e = make_ellipse_params(pos, rows_by_pos[pos], h_img, dx_extra=0, dy_extra=0)
+        u, v, c, s = precompute_uv(xs, ys, e["cx"], e["cy"], e["theta"])
+        normal_mask |= ellipse_mask_from_uv(u, v, e["a"], e["b"], du=0.0, dv=0.0)
+
+    out_normal = out_rate_weighted_mask(normal_mask, ws)
+
+    out_normal = out_rate_weighted(xs_all, ys_all, ws_all, ellipse_params_normal)
     st.write(f"通常守備 Out%（モデル）: **{out_normal:.3f}**")
     st.write(f"通常守備 BA換算（≒1-Out%）: **{(1-out_normal):.3f}**")
 
@@ -608,12 +1361,7 @@ else:
                 "探索するポジションの選手が未選択です（SS/2Bを選んでください）。"
             )
         else:
-            # ---------------------------
-            # データ点（math座標）
-            # ---------------------------
-            xs = df_ground["x_math"].to_numpy(dtype=float)
-            ys = df_ground["y_math"].to_numpy(dtype=float)
-            n = len(xs)
+
             if n == 0:
                 st.warning("ゴロデータが0件です。")
             else:
@@ -693,7 +1441,9 @@ else:
                                     if b2_mask is not None:
                                         out_mask = out_mask | b2_mask
 
-                                    out_rate = out_mask.mean()
+                                    out_rate = (
+                                        ws * out_mask.astype(float)
+                                    ).sum() / sum_w
 
                                     if out_rate > best_out:
                                         best_out = out_rate
