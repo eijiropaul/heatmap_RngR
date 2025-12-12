@@ -1,5 +1,5 @@
 streamlit
-plotly
+matplotlib
+numpy
 pandas
 Pillow
-streamlit-image-coordinates
