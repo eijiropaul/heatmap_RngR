@@ -25,7 +25,6 @@ ELLIPSE_CSV_PATHS = {
     "1B": "SAO-RBB(1B).csv",
 }
 
-
 # Streamlit側クリック画像サイズ
 REC_WIDTH, REC_HEIGHT = 750, 750
 
@@ -91,12 +90,12 @@ def intersect_lines(p1, v1, p2, v2, eps=1e-9):
 def load_main_data():
     df = pd.read_csv(CSV_PATH, encoding="cp932")
 
-    # 投手名「なし」除外
+    # 投手名（あなたの列名：pitchername）
     df["pitchername"] = df["pitchername"].astype(str)
     df = df[df["pitchername"].notna()]
-    # df = df[df["pitchername"] != "なし"]
+    # df = df[df["pitchername"] != "なし"]  # 必要なら復活
 
-    # フィルタ列も全部文字列化（値の揺れ対策）
+    # フィルタ列を文字列化（値の揺れ対策）
     for c in [
         "opponents",
         "pitch_course",
@@ -122,7 +121,7 @@ def load_ellipse_tables():
     return tables
 
 
-def build_heatmap(df_filtered, img, w_img, h_img):
+def build_heatmap(df_filtered, img, w_img, h_img, use_projection=True):
     # クリック→元画像座標
     scale_x = w_img / REC_WIDTH
     scale_y = h_img / REC_HEIGHT
@@ -133,7 +132,7 @@ def build_heatmap(df_filtered, img, w_img, h_img):
     df_filtered["x_coord_img"] = df_filtered["x_click"] * scale_x
     df_filtered["y_coord_img"] = df_filtered["y_click"] * scale_y
 
-    # ゴロのみ（必要ならここをUI化できる）
+    # ゴロのみ
     df_ground = df_filtered[
         df_filtered["hit_type"].str.contains("ゴロ", na=False)
     ].copy()
@@ -155,41 +154,47 @@ def build_heatmap(df_filtered, img, w_img, h_img):
     if len(df_ground) == 0:
         return None
 
-    # 投影
-    v_left = (left_pt[0] - ray_origin[0], left_pt[1] - ray_origin[1])
-    v_right = (right_pt[0] - ray_origin[0], right_pt[1] - ray_origin[1])
+    # ------------------- 投影（ON/OFF切替） -------------------
+    if use_projection:
+        v_left = (left_pt[0] - ray_origin[0], left_pt[1] - ray_origin[1])
+        v_right = (right_pt[0] - ray_origin[0], right_pt[1] - ray_origin[1])
 
-    proj_x, proj_y = [], []
-    for _, row in df_ground.iterrows():
-        x = row["x_coord_img"]
-        y = row["y_coord_img"]
-        if not np.isfinite(x) or not np.isfinite(y):
-            proj_x.append(x)
-            proj_y.append(y)
-            continue
+        proj_x, proj_y = [], []
+        for _, row in df_ground.iterrows():
+            x = row["x_coord_img"]
+            y = row["y_coord_img"]
+            if not np.isfinite(x) or not np.isfinite(y):
+                proj_x.append(x)
+                proj_y.append(y)
+                continue
 
-        v_home = dir_vector_from_home_angle(row["angle_deg"])
-        v_bound = v_left if x <= ray_origin[0] else v_right
-        inter = intersect_lines(home, v_home, ray_origin, v_bound)
+            v_home = dir_vector_from_home_angle(row["angle_deg"])
+            v_bound = v_left if x <= ray_origin[0] else v_right
+            inter = intersect_lines(home, v_home, ray_origin, v_bound)
 
-        if inter is None:
-            proj_x.append(x)
-            proj_y.append(y)
-            continue
+            if inter is None:
+                proj_x.append(x)
+                proj_y.append(y)
+                continue
 
-        ix, iy = inter
-        d_ball = math.hypot(x - home[0], y - home[1])
-        d_inter = math.hypot(ix - home[0], iy - home[1])
+            ix, iy = inter
+            d_ball = math.hypot(x - home[0], y - home[1])
+            d_inter = math.hypot(ix - home[0], iy - home[1])
 
-        if d_ball > d_inter:
-            proj_x.append(ix)
-            proj_y.append(iy)
-        else:
-            proj_x.append(x)
-            proj_y.append(y)
+            if d_ball > d_inter:
+                proj_x.append(ix)
+                proj_y.append(iy)
+            else:
+                proj_x.append(x)
+                proj_y.append(y)
 
-    df_ground["x_proj_img"] = proj_x
-    df_ground["y_proj_img"] = proj_y
+        df_ground["x_proj_img"] = proj_x
+        df_ground["y_proj_img"] = proj_y
+
+    else:
+        # 投影なし：元の座標をそのまま使う
+        df_ground["x_proj_img"] = df_ground["x_coord_img"]
+        df_ground["y_proj_img"] = df_ground["y_coord_img"]
 
     # math座標へ
     df_ground["x_math"] = df_ground["x_proj_img"]
@@ -218,7 +223,6 @@ def build_heatmap(df_filtered, img, w_img, h_img):
         vmin, vmax = 1e-3, 1.0
 
     norm = LogNorm(vmin=vmin, vmax=vmax)
-
     return counts_masked, xedges, yedges, norm, len(df_ground)
 
 
@@ -256,10 +260,9 @@ ellipse_tables = load_ellipse_tables()
 pitchers = sorted(df["pitchername"].dropna().unique().tolist())
 pitcher = st.selectbox("投手名を選択", pitchers, index=0)
 
-# フィルタ候補を投手で絞った範囲から作る（選択肢が見やすい）
+# フィルタ候補を投手で絞った範囲から作る
 df_p = df[df["pitchername"] == pitcher].copy()
 
-# 4つのフィルタ（複数選択）
 st.subheader("投球条件フィルタ（複数選択可・未選択なら全て）")
 
 
@@ -278,7 +281,12 @@ sel_height = multiselect_filter("pitch_height（高さ）", "pitch_height")
 sel_type = multiselect_filter("pitch_type（球種）", "pitch_type")
 sel_lr = multiselect_filter("player_batLR（打者左右）", "player_batLR")
 
-# 守備範囲（ポジション別に選手を選択）
+# ★ 追加：投影ON/OFF
+use_projection = st.checkbox(
+    "境界線への投影を使う（深いゴロを境界線に落とし込む）", value=True
+)
+
+# 守備範囲（選手）
 st.subheader("守備範囲を表示する選手（各ポジション）")
 selected_player = {}
 for pos in ["SS", "2B", "3B", "1B"]:
@@ -314,7 +322,7 @@ img = mpimg.imread(IMAGE_PATH)
 h_img, w_img = img.shape[0], img.shape[1]
 img_flipped = np.flipud(img)
 
-res = build_heatmap(df_f, img, w_img, h_img)
+res = build_heatmap(df_f, img, w_img, h_img, use_projection=use_projection)
 
 if res is None:
     st.warning("フィルタ後のゴロデータが0件です。条件を緩めてください。")
@@ -356,7 +364,10 @@ else:
 
     ax.set_xlim(0, w_img)
     ax.set_ylim(0, h_img)
-    ax.set_title(f"Heatmap + Ranges | {pitcher}")
+
+    proj_text = "Projected" if use_projection else "No Projection"
+    ax.set_title(f"Heatmap + Ranges | {pitcher} | {proj_text}")
+
     ax.set_xlabel("x")
     ax.set_ylabel("y (math coords: up is +)")
 
