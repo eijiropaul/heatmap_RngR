@@ -201,8 +201,8 @@ def build_heatmap(df_filtered, img, w_img, h_img):
 
     non_zero = counts_masked[~np.isnan(counts_masked)]
     if non_zero.size > 0:
-        low_p = 20
-        high_p = 99.5
+        low_p = 10
+        high_p = 70
         vmin = np.percentile(non_zero, low_p)
         vmax = np.percentile(non_zero, high_p)
         counts_masked[counts_masked < vmin] = np.nan
