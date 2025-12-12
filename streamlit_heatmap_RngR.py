@@ -1342,164 +1342,146 @@ else:
     # 探索設定（軽め）
 
     do_opt = st.checkbox(
-        "SS・2Bの位置を動かして最適Out%を探す（簡易グリッド探索）", value=False
+        "SS・2B・3B・1Bの位置を動かして最適Out%を探す（簡易グリッド探索）", value=False
     )
 
     if do_opt:
         max_shift = st.slider(
-            "探索幅（±px）", min_value=0, max_value=60, value=20, step=5
+            "探索幅（±px）", min_value=0, max_value=100, value=20, step=5
         )
         step = st.slider("刻み（px）", min_value=1, max_value=20, value=10, step=1)
 
         move_ss = st.checkbox("SSを動かす", value=True)
         move_2b = st.checkbox("2Bを動かす", value=True)
+        move_3b = st.checkbox("3Bを動かす", value=True)
+        move_1b = st.checkbox("1Bを動かす", value=True)
 
-        if (move_ss and "SS" not in rows_by_pos) or (
-            move_2b and "2B" not in rows_by_pos
-        ):
-            st.warning(
-                "探索するポジションの選手が未選択です（SS/2Bを選んでください）。"
-            )
+        move_flags = {"SS": move_ss, "2B": move_2b, "3B": move_3b, "1B": move_1b}
+
+        missing = [
+            p
+            for p in ["SS", "2B", "3B", "1B"]
+            if move_flags.get(p, False) and (p not in rows_by_pos)
+        ]
+        if missing:
+            st.warning(f"探索するポジションの選手が未選択です: {missing}")
         else:
 
             if n == 0:
                 st.warning("ゴロデータが0件です。")
             else:
-                # ---------------------------
-                # ② 固定ポジション（1B/3B）のmaskを1回だけ計算して使い回し
-                # ---------------------------
-                fixed_mask = np.zeros(n, dtype=bool)
+                shifts = list(range(-max_shift, max_shift + 1, step))
 
-                for pos in ["1B", "3B"]:
-                    if pos not in rows_by_pos:
-                        continue
-                    e = make_ellipse_params(
-                        pos, rows_by_pos[pos], h_img, dx_extra=0, dy_extra=0
+                # 動かすポジション（選択されている & 選手が選ばれているものだけ）
+                move_positions = []
+                for pos in ["SS", "2B", "3B", "1B"]:
+                    if move_flags.get(pos, False) and (pos in rows_by_pos):
+                        move_positions.append(pos)
+
+                # 1つも動かさないなら終了
+                if len(move_positions) == 0:
+                    st.warning(
+                        "動かすポジションがありません（選手未選択 or チェックOFF）。"
                     )
-                    u, v, c, s = precompute_uv(xs, ys, e["cx"], e["cy"], e["theta"])
-                    fixed_mask |= ellipse_mask_from_uv(
-                        u, v, e["a"], e["b"], du=0.0, dv=0.0
-                    )
+                else:
+                    # ---------------------------
+                    # 固定ポジ（動かさないポジ）のmaskを先に作る
+                    # ---------------------------
+                    fixed_mask = np.zeros(n, dtype=bool)
 
-                # ---------------------------
-                # ① SS/2B は前計算（u,v,c,s）を作り、シフトごとは(du,dv)だけで判定
-                # ---------------------------
-                ss_pack = None
-                b2_pack = None
+                    for pos in ["SS", "2B", "3B", "1B"]:
+                        if pos not in rows_by_pos:
+                            continue
+                        if pos in move_positions:
+                            continue  # 動かすので固定には入れない
 
-                if move_ss and "SS" in rows_by_pos:
-                    e0 = make_ellipse_params(
-                        "SS", rows_by_pos["SS"], h_img, dx_extra=0, dy_extra=0
-                    )
-                    u, v, c, s = precompute_uv(xs, ys, e0["cx"], e0["cy"], e0["theta"])
-                    ss_pack = (e0, u, v, c, s)
+                        e = make_ellipse_params(
+                            pos, rows_by_pos[pos], h_img, dx_extra=0, dy_extra=0
+                        )
+                        u, v, c, s = precompute_uv(xs, ys, e["cx"], e["cy"], e["theta"])
+                        fixed_mask |= ellipse_mask_from_uv(
+                            u, v, e["a"], e["b"], du=0.0, dv=0.0
+                        )
 
-                if move_2b and "2B" in rows_by_pos:
-                    e0 = make_ellipse_params(
-                        "2B", rows_by_pos["2B"], h_img, dx_extra=0, dy_extra=0
-                    )
-                    u, v, c, s = precompute_uv(xs, ys, e0["cx"], e0["cy"], e0["theta"])
-                    b2_pack = (e0, u, v, c, s)
+                    # ---------------------------
+                    # 動かすポジは u,v,c,s を前計算しておく
+                    # ---------------------------
+                    packs = {}  # pos -> (e0, u, v, c, s)
+                    for pos in move_positions:
+                        e0 = make_ellipse_params(
+                            pos, rows_by_pos[pos], h_img, dx_extra=0, dy_extra=0
+                        )
+                        u, v, c, s = precompute_uv(
+                            xs, ys, e0["cx"], e0["cy"], e0["theta"]
+                        )
+                        packs[pos] = (e0, u, v, c, s)
 
-                # ---------------------------
-                # 探索関数（ベクトル化）
-                # ---------------------------
-                def search_best(shifts_ss, shifts_b2):
-                    best_out = -1.0
-                    best_cfg = {"SS_dx": 0, "SS_dy": 0, "2B_dx": 0, "2B_dy": 0}
+                    # ---------------------------
+                    # 評価関数（重み付き Out%）
+                    # ---------------------------
+                    def eval_out_rate(cfg):
+                        out_mask = fixed_mask  # copyしない（軽い）
+                        for pos, pack in packs.items():
+                            e0, u, v, c, s = pack
+                            dx = cfg.get(f"{pos}_dx", 0)
+                            dy = cfg.get(f"{pos}_dy", 0)
+                            du, dv = shift_to_du_dv(dx, dy, c, s)
+                            out_mask = out_mask | ellipse_mask_from_uv(
+                                u, v, e0["a"], e0["b"], du=du, dv=dv
+                            )
 
-                    # SS側の候補
-                    ss_dx_list = shifts_ss if ss_pack is not None else [0]
-                    ss_dy_list = shifts_ss if ss_pack is not None else [0]
-                    b2_dx_list = shifts_b2 if b2_pack is not None else [0]
-                    b2_dy_list = shifts_b2 if b2_pack is not None else [0]
+                        # ★重み付き Out%（ws, sum_w はあなたの既存変数を使用）
+                        return (ws * out_mask.astype(float)).sum() / sum_w
 
-                    for ss_dx in ss_dx_list:
-                        for ss_dy in ss_dy_list:
-                            ss_mask = None
-                            if ss_pack is not None:
-                                e0, u, v, c, s = ss_pack
-                                du, dv = shift_to_du_dv(ss_dx, ss_dy, c, s)
-                                ss_mask = ellipse_mask_from_uv(
-                                    u, v, e0["a"], e0["b"], du=du, dv=dv
-                                )
+                    # ---------------------------
+                    # 座標降下：1ポジずつ最適にしていく（軽い）
+                    # ---------------------------
+                    n_iters = st.slider("最適化の反復回数（軽い）", 1, 8, 3, 1)
 
-                            for b2_dx in b2_dx_list:
-                                for b2_dy in b2_dy_list:
-                                    b2_mask = None
-                                    if b2_pack is not None:
-                                        e0, u, v, c, s = b2_pack
-                                        du, dv = shift_to_du_dv(b2_dx, b2_dy, c, s)
-                                        b2_mask = ellipse_mask_from_uv(
-                                            u, v, e0["a"], e0["b"], du=du, dv=dv
-                                        )
+                    cur = {}
+                    for pos in move_positions:
+                        cur[f"{pos}_dx"] = 0
+                        cur[f"{pos}_dy"] = 0
 
-                                    # ★固定maskにORするだけ（copyしない）
-                                    out_mask = fixed_mask
-                                    if ss_mask is not None:
-                                        out_mask = out_mask | ss_mask
-                                    if b2_mask is not None:
-                                        out_mask = out_mask | b2_mask
+                    best_out = eval_out_rate(cur)
 
-                                    out_rate = (
-                                        ws * out_mask.astype(float)
-                                    ).sum() / sum_w
+                    for it in range(n_iters):
+                        improved = False
 
-                                    if out_rate > best_out:
-                                        best_out = out_rate
-                                        best_cfg = {
-                                            "SS_dx": int(ss_dx),
-                                            "SS_dy": int(ss_dy),
-                                            "2B_dx": int(b2_dx),
-                                            "2B_dy": int(b2_dy),
-                                        }
-                    return best_out, best_cfg
+                        for pos in move_positions:
+                            best_local = best_out
+                            best_dx = cur[f"{pos}_dx"]
+                            best_dy = cur[f"{pos}_dy"]
 
-                # ---------------------------
-                # ③ 粗→細探索（機能は同じ、速い）
-                # ---------------------------
-                coarse_step = max(1, step)  # UIのstepを粗探索に使う
-                fine_step = max(1, step // 3)  # 細探索は3倍くらい細かく（好みで調整可）
-                shifts_coarse = list(range(-max_shift, max_shift + 1, coarse_step))
+                            # このposだけ(dx,dy)を総当たり（他posは固定）
+                            for dx in shifts:
+                                for dy in shifts:
+                                    trial = dict(cur)
+                                    trial[f"{pos}_dx"] = int(dx)
+                                    trial[f"{pos}_dy"] = int(dy)
 
-                with st.spinner("粗探索中..."):
-                    best_out_c, best_cfg_c = search_best(shifts_coarse, shifts_coarse)
+                                    out_rate = eval_out_rate(trial)
+                                    if out_rate > best_local:
+                                        best_local = out_rate
+                                        best_dx, best_dy = int(dx), int(dy)
 
-                # 粗探索の最良点の近傍だけ細探索
-                def around(center, radius, step_):
-                    start = int(center - radius)
-                    end = int(center + radius)
-                    return list(range(start, end + 1, step_))
+                            # 更新
+                            if best_local > best_out:
+                                cur[f"{pos}_dx"] = best_dx
+                                cur[f"{pos}_dy"] = best_dy
+                                best_out = best_local
+                                improved = True
 
-                radius = coarse_step  # 近傍幅（粗刻み1つ分）
-                ss_dx0, ss_dy0 = best_cfg_c["SS_dx"], best_cfg_c["SS_dy"]
-                b2_dx0, b2_dy0 = best_cfg_c["2B_dx"], best_cfg_c["2B_dy"]
+                        if not improved:
+                            break
 
-                # SS/2Bそれぞれの近傍を作る（同じリストで回してもOKだが、ここは範囲を詰める）
-                shifts_fine_ss = sorted(
-                    set(
-                        around(ss_dx0, radius, fine_step)
-                        + around(ss_dy0, radius, fine_step)
-                    )
-                )
-                shifts_fine_b2 = sorted(
-                    set(
-                        around(b2_dx0, radius, fine_step)
-                        + around(b2_dy0, radius, fine_step)
-                    )
-                )
+                    opt_best_out = best_out
+                    opt_result = cur
+                    opt_delta = opt_best_out - out_normal
 
-                with st.spinner("細探索中..."):
-                    best_out, best_cfg = search_best(shifts_fine_ss, shifts_fine_b2)
-
-                delta = best_out - out_normal
-                opt_result = best_cfg
-                opt_delta = delta
-                opt_best_out = best_out
-
-                st.write(f"最適Out%（探索）: **{best_out:.3f}**")
-                st.write(f"ΔOut%（最適−通常）: **{delta:+.3f}**")
-                st.caption(f"最適シフト（追加移動量, px）: {best_cfg}")
+                    st.write(f"最適Out%（探索）: **{opt_best_out:.3f}**")
+                    st.write(f"ΔOut%（最適−通常）: **{opt_delta:+.3f}**")
+                    st.caption(f"最適シフト（追加移動量, px）: {opt_result}")
 
                 # =========================
                 # ΔOut% の不確実性（軽量ブートストラップ：best_cfg固定）
@@ -1591,9 +1573,11 @@ else:
     show_opt = st.checkbox("最適配置（探索結果）を図に重ねる", value=True)
 
     if show_opt and (opt_result is not None):
-        for pos in ["SS", "2B"]:
+        for pos in ["SS", "2B", "3B", "1B"]:
             pick = selected_player[pos]
             if pick == "（表示しない）":
+                continue
+            if f"{pos}_dx" not in opt_result:
                 continue
 
             t = ellipse_tables[pos]
@@ -1602,13 +1586,15 @@ else:
             dx = float(opt_result.get(f"{pos}_dx", 0))
             dy = float(opt_result.get(f"{pos}_dy", 0))
 
-            ax.scatter(
-                infield_positions_img[pos][0] + float(row["center_x"]) + dx,
-                h_img - (infield_positions_img[pos][1] + float(row["center_y"]) + dy),
-                s=140,
-                marker="x",
-            )
+            # 最適位置の点
+            base_x_img, base_y_img = infield_positions_img[pos]
+            cx_img = base_x_img + float(row["center_x"]) + dx
+            cy_img = base_y_img + float(row["center_y"]) + dy
+            cx = cx_img
+            cy = h_img - cy_img
+            ax.scatter(cx, cy, s=140, marker="x")
 
+            # 破線の楕円
             add_ellipse(
                 ax,
                 pos,
