@@ -99,13 +99,6 @@ def precompute_rotated_uv(xs, ys, cx, cy, theta_deg):
     return u, v, c, s
 
 
-def shift_to_du_dv(dx_shift, dy_shift, c, s):
-    # シフト(dx,dy)が回転座標(u,v)でどれだけの平行移動になるか
-    du = c * dx_shift + s * dy_shift
-    dv = -s * dx_shift + c * dy_shift
-    return du, dv
-
-
 @st.cache_data
 def load_main_data():
     df = pd.read_csv(CSV_PATH, encoding="cp932")
@@ -165,67 +158,6 @@ def to_polar_from_home(df_ground, home_math):
     return theta, r
 
 
-def fit_conditional_hist(
-    df_ground, home_math, feat_cols, n_theta=36, n_r=18, r_max=None, laplace=1.0
-):
-    """
-    条件キー(カテゴリの結合)ごとに (theta,r) の2Dヒストを作る
-    laplace>0 でスムージングして疎データでも破綻しにくくする
-    """
-    theta, r = to_polar_from_home(df_ground, home_math)
-
-    if r_max is None:
-        r_max = np.percentile(r, 99.5)
-        r_max = max(r_max, 1.0)
-
-    theta_edges = np.linspace(-np.pi, np.pi, n_theta + 1)
-    r_edges = np.linspace(0, r_max, n_r + 1)
-
-    keys = df_ground[feat_cols].astype(str).agg("|".join, axis=1).to_numpy()
-
-    model = {
-        "feat_cols": feat_cols,
-        "theta_edges": theta_edges,
-        "r_edges": r_edges,
-        "tables": {},
-        "counts": {},
-        "r_max": r_max,
-        "laplace": laplace,
-    }
-
-    # 全体（バックオフ用）
-    H_all, _, _ = np.histogram2d(theta, r, bins=[theta_edges, r_edges])
-    model["tables"]["__ALL__"] = H_all + laplace
-    model["counts"]["__ALL__"] = int(len(df_ground))
-
-    for k in np.unique(keys):
-        m = keys == k
-        if m.sum() < 2:
-            continue
-        H, _, _ = np.histogram2d(theta[m], r[m], bins=[theta_edges, r_edges])
-        model["tables"][k] = H + laplace
-        model["counts"][k] = int(m.sum())
-
-    return model
-
-
-def _sample_from_hist(H, theta_edges, r_edges, n_samples, rng):
-    P = H / H.sum()
-    idx = rng.choice(P.size, size=n_samples, p=P.ravel())
-
-    it = idx // (len(r_edges) - 1)
-    ir = idx % (len(r_edges) - 1)
-
-    th0 = theta_edges[it]
-    th1 = theta_edges[it + 1]
-    rr0 = r_edges[ir]
-    rr1 = r_edges[ir + 1]
-
-    theta = rng.uniform(th0, th1)
-    r = rng.uniform(rr0, rr1)
-    return theta, r
-
-
 def build_training_ground(df_all, w_img, h_img, use_projection_for_train=False):
     """
     フェーズ3用：
@@ -258,73 +190,6 @@ def xy_to_theta_r(xs, ys, home_math):
     theta = np.arctan2(dy, dx)  # [-π,π]
     r = np.hypot(dx, dy)
     return theta, r
-
-
-def fit_conditional_hist(
-    df_ground,
-    home_math,
-    feat_cols,
-    n_theta=36,
-    n_r=18,
-    laplace=1.0,
-):
-    """
-    条件 → (theta,r) 分布 を学習
-    """
-    model = {}
-
-    xs = df_ground["x_math"].to_numpy()
-    ys = df_ground["y_math"].to_numpy()
-    theta, r = xy_to_theta_r(xs, ys, home_math)
-
-    df = df_ground.copy()
-    df["_theta"] = theta
-    df["_r"] = r
-
-    for key, g in df.groupby(feat_cols):
-        th = g["_theta"].to_numpy()
-        rr = g["_r"].to_numpy()
-
-        H, th_edges, r_edges = np.histogram2d(
-            th,
-            rr,
-            bins=[n_theta, n_r],
-            range=[[-np.pi, np.pi], [0, np.max(r)]],
-        )
-
-        # Laplace smoothing
-        H = H + laplace
-        H = H / H.sum()
-
-        model[key] = {
-            "H": H,
-            "th_edges": th_edges,
-            "r_edges": r_edges,
-        }
-
-    return model
-
-
-def sample_from_hist(model, cond_tuple, n_samples, home_math, rng):
-    if cond_tuple not in model:
-        return None
-
-    H = model[cond_tuple]["H"]
-    th_edges = model[cond_tuple]["th_edges"]
-    r_edges = model[cond_tuple]["r_edges"]
-
-    flat = H.flatten()
-    idx = rng.choice(len(flat), size=n_samples, p=flat)
-
-    it, ir = np.unravel_index(idx, H.shape)
-
-    th = rng.uniform(th_edges[it], th_edges[it + 1])
-    rr = rng.uniform(r_edges[ir], r_edges[ir + 1])
-
-    x = home_math[0] + rr * np.cos(th)
-    y = home_math[1] + rr * np.sin(th)
-
-    return x, y
 
 
 def build_heatmap(df_filtered, img, w_img, h_img, use_projection=True):
@@ -988,17 +853,6 @@ def out_rate_from_points(xs, ys, ellipse_list):
     return out_mask.mean()
 
 
-@st.cache_data
-def build_training_ground(df_all, w_img, h_img, use_projection_for_train=False):
-    out = build_heatmap(
-        df_all, None, w_img, h_img, use_projection=use_projection_for_train
-    )
-    if out is None:
-        return None
-    *_, df_ground_all = out
-    return df_ground_all
-
-
 def out_rate_weighted(xs, ys, ws, ellipse_list):
     if xs.size == 0:
         return np.nan
@@ -1019,6 +873,85 @@ def out_rate_weighted(xs, ys, ws, ellipse_list):
     return (ws * out_mask.astype(float)).sum() / ws.sum()
 
 
+def out_prob_from_uv(u, v, a, b, du=0.0, dv=0.0, alpha=2.197):
+    """
+    q = ((u-du)/a)^2 + ((v-dv)/b)^2
+    p_out = 1/(1+exp(alpha*(q-1)))
+      - 楕円縁(q=1) -> 0.5
+      - 中心(q=0)  -> 約0.9（alpha≈2.197のとき）
+    """
+    q = ((u - du) / a) ** 2 + ((v - dv) / b) ** 2
+    z = alpha * (q - 1.0)
+    z = np.clip(z, -60, 60)  # overflow防止
+    return 1.0 / (1.0 + np.exp(z))
+
+
+def combine_out_probs(probs_list, n=None):
+    """
+    複数ポジションのアウト確率を合成（独立近似）
+    p_total = 1 - Π(1 - p_i)
+    空なら p_out=0 を返す
+    """
+    if len(probs_list) == 0:
+        return None
+
+    p_not = np.ones_like(probs_list[0], dtype=float)
+    for p in probs_list:
+        p_not *= 1.0 - p
+    return 1.0 - p_not
+
+
+def out_rate_weighted_prob(p_out, ws):
+    if p_out is None:
+        return np.nan
+
+    denom = ws.sum()
+    if denom <= 0:
+        return np.nan
+    return float((ws * p_out).sum() / denom)
+
+
+def eval_out_rate_prob_points(xs, ys, ws, rows_by_pos, opt_cfg, h_img, alpha):
+    """
+    xs, ys, ws : 評価対象点（bootstrap後）
+    rows_by_pos: {pos: row}
+    opt_cfg    : {"SS_dx":..., "SS_dy":..., ...}
+    """
+    probs_list = []
+
+    for pos, row in rows_by_pos.items():
+        dx = float(opt_cfg.get(f"{pos}_dx", 0.0))
+        dy = float(opt_cfg.get(f"{pos}_dy", 0.0))
+
+        e = make_ellipse_params(pos, row, h_img, dx_extra=dx, dy_extra=dy)
+
+        u, v, c, s = precompute_uv(xs, ys, e["cx"], e["cy"], e["theta"])
+
+        p = out_prob_from_uv(u, v, e["a"], e["b"], du=0.0, dv=0.0, alpha=alpha)
+        probs_list.append(p)
+
+    p_total = combine_out_probs(probs_list)
+    return out_rate_weighted_prob(p_total, ws)
+
+
+def eval_out_rate_hard_points(xs, ys, ws, rows_by_pos, cfg, h_img):
+    n = len(xs)
+    out_mask = np.zeros(n, dtype=bool)
+
+    for pos in ["SS", "2B", "3B", "1B"]:
+        if pos not in rows_by_pos:
+            continue
+
+        dx = float(cfg.get(f"{pos}_dx", 0.0))
+        dy = float(cfg.get(f"{pos}_dy", 0.0))
+
+        e = make_ellipse_params(pos, rows_by_pos[pos], h_img, dx_extra=dx, dy_extra=dy)
+        u, v, c, s = precompute_uv(xs, ys, e["cx"], e["cy"], e["theta"])
+        out_mask |= ellipse_mask_from_uv(u, v, e["a"], e["b"], du=0.0, dv=0.0)
+
+    return out_rate_weighted_mask(out_mask, ws)
+
+
 # =========================
 # UI
 # =========================
@@ -1027,12 +960,21 @@ st.title("Pitcher Heatmap + Defensive Range (Filters)")
 df = load_main_data()
 ellipse_tables = load_ellipse_tables()
 
-# 投手名
+# 投手名（全投手オプション付き）
 pitchers = sorted(df["pitchername"].dropna().unique().tolist())
-pitcher = st.selectbox("投手名を選択", pitchers, index=0)
+ALL_PITCHERS_LABEL = "（全投手）"
+
+pitcher = st.selectbox(
+    "投手名を選択",
+    options=[ALL_PITCHERS_LABEL] + pitchers,
+    index=0,
+)
 
 # フィルタ候補を投手で絞った範囲から作る
-df_p = df[df["pitchername"] == pitcher].copy()
+if pitcher == ALL_PITCHERS_LABEL:
+    df_p = df.copy()
+else:
+    df_p = df[df["pitchername"] == pitcher].copy()
 
 st.subheader("投球条件フィルタ（複数選択可・未選択なら全て）")
 
@@ -1201,18 +1143,11 @@ else:
             right_pt_img=right_pt,
         )
 
-        if xg is None:
-            st.warning(
-                "AI生成点が除外条件（ファール/ホーム寄り境界）で全て落ちました。条件を緩めるか n_gen を下げてください。"
-            )
-        else:
-            # ここから先は今まで通り（xs_allにconcat、scatter表示など）
-            ...
-
-        gw = float(gen_weight)
-        xs_all = np.concatenate([xs_obs, xg])
-        ys_all = np.concatenate([ys_obs, yg])
-        ws_all = np.concatenate([ws_obs, np.full(n_gen, gw, dtype=float)])
+        if xg is not None:
+            gw = float(gen_weight)
+            xs_all = np.concatenate([xs_obs, xg])
+            ys_all = np.concatenate([ys_obs, yg])
+            ws_all = np.concatenate([ws_obs, np.full(len(xg), gw, dtype=float)])
 
         st.caption(
             f"AI生成点 {n_gen}点（重み={gw}）を追加 / key='{used_key if used_key else 'N/A'}'"
@@ -1312,6 +1247,53 @@ else:
         rows_by_pos[pos] = row
         ellipse_params_normal.append(make_ellipse_params(pos, row, h_img))
 
+    if len(rows_by_pos) == 0:
+        st.warning(
+            "守備範囲の選手が未選択です（SS/2B/3B/1Bのいずれかを選んでください）"
+        )
+        st.stop()
+
+    # ==================================
+    # 評価関数を統一（通常も最適もここを使う）
+    # ==================================
+
+    xs = xs_all
+    ys = ys_all
+    ws = ws_all
+    n = len(xs)
+
+    use_prob = st.checkbox("Out%を確率モデルで評価（中心0.9/縁0.5）", value=True)
+    alpha_prob = st.slider(
+        "確率の鋭さ alpha（大きいほど0/1に近づく）", 0.5, 8.0, 2.2, 0.1
+    )
+
+    # 事前計算（確率用）: u,v,c,s は毎回作らない
+    packs_all = {}
+    for pos in ["SS", "2B", "3B", "1B"]:
+        if pos not in rows_by_pos:
+            continue
+        e0 = make_ellipse_params(pos, rows_by_pos[pos], h_img, dx_extra=0, dy_extra=0)
+        u0, v0, c0, s0 = precompute_uv(xs, ys, e0["cx"], e0["cy"], e0["theta"])
+        packs_all[pos] = (e0, u0, v0, c0, s0)
+
+    def eval_out_rate_prob(cfg):
+        probs_list = []
+        for pos, (e0, u, v, c, s) in packs_all.items():
+            dx = float(cfg.get(f"{pos}_dx", 0.0))
+            dy = float(cfg.get(f"{pos}_dy", 0.0))
+            du, dv = shift_to_du_dv(dx, dy, c, s)
+            p = out_prob_from_uv(u, v, e0["a"], e0["b"], du=du, dv=dv, alpha=alpha_prob)
+            probs_list.append(p)
+
+        p_total = combine_out_probs(probs_list)  # ← n渡す版にしておく
+        return out_rate_weighted_prob(p_total, ws)
+
+    def eval_out_rate_hard(cfg):
+        return eval_out_rate_hard_points(xs, ys, ws, rows_by_pos, cfg, h_img)
+
+    def eval_out(cfg):
+        return eval_out_rate_prob(cfg) if use_prob else eval_out_rate_hard(cfg)
+
     # =========================
     # 通常守備 Out%（重み付き）
     # =========================
@@ -1319,23 +1301,10 @@ else:
     # データ点（math座標）
     # ---------------------------
     # ここを生成込みに差し替え
-    xs = xs_all
-    ys = ys_all
-    ws = ws_all
-    n = len(xs)
+
     sum_w = ws.sum()
-    normal_mask = np.zeros(n, dtype=bool)
 
-    for pos in ["1B", "2B", "3B", "SS"]:
-        if pos not in rows_by_pos:
-            continue
-        e = make_ellipse_params(pos, rows_by_pos[pos], h_img, dx_extra=0, dy_extra=0)
-        u, v, c, s = precompute_uv(xs, ys, e["cx"], e["cy"], e["theta"])
-        normal_mask |= ellipse_mask_from_uv(u, v, e["a"], e["b"], du=0.0, dv=0.0)
-
-    out_normal = out_rate_weighted_mask(normal_mask, ws)
-
-    out_normal = out_rate_weighted(xs_all, ys_all, ws_all, ellipse_params_normal)
+    out_normal = eval_out({})
     st.write(f"通常守備 Out%（モデル）: **{out_normal:.3f}**")
     st.write(f"通常守備 BA換算（≒1-Out%）: **{(1-out_normal):.3f}**")
 
@@ -1404,46 +1373,18 @@ else:
                         )
 
                     # ---------------------------
-                    # 動かすポジは u,v,c,s を前計算しておく
-                    # ---------------------------
-                    packs = {}  # pos -> (e0, u, v, c, s)
-                    for pos in move_positions:
-                        e0 = make_ellipse_params(
-                            pos, rows_by_pos[pos], h_img, dx_extra=0, dy_extra=0
-                        )
-                        u, v, c, s = precompute_uv(
-                            xs, ys, e0["cx"], e0["cy"], e0["theta"]
-                        )
-                        packs[pos] = (e0, u, v, c, s)
-
-                    # ---------------------------
-                    # 評価関数（重み付き Out%）
-                    # ---------------------------
-                    def eval_out_rate(cfg):
-                        out_mask = fixed_mask  # copyしない（軽い）
-                        for pos, pack in packs.items():
-                            e0, u, v, c, s = pack
-                            dx = cfg.get(f"{pos}_dx", 0)
-                            dy = cfg.get(f"{pos}_dy", 0)
-                            du, dv = shift_to_du_dv(dx, dy, c, s)
-                            out_mask = out_mask | ellipse_mask_from_uv(
-                                u, v, e0["a"], e0["b"], du=du, dv=dv
-                            )
-
-                        # ★重み付き Out%（ws, sum_w はあなたの既存変数を使用）
-                        return (ws * out_mask.astype(float)).sum() / sum_w
-
-                    # ---------------------------
                     # 座標降下：1ポジずつ最適にしていく（軽い）
                     # ---------------------------
                     n_iters = st.slider("最適化の反復回数（軽い）", 1, 8, 3, 1)
 
-                    cur = {}
+                    cur0 = {}
                     for pos in move_positions:
-                        cur[f"{pos}_dx"] = 0
-                        cur[f"{pos}_dy"] = 0
+                        cur0[f"{pos}_dx"] = 0
+                        cur0[f"{pos}_dy"] = 0
 
-                    best_out = eval_out_rate(cur)
+                    out_normal_eval = eval_out(cur0)
+                    best_out = eval_out(cur0)
+                    cur = dict(cur0)
 
                     for it in range(n_iters):
                         improved = False
@@ -1456,19 +1397,21 @@ else:
                             # このposだけ(dx,dy)を総当たり（他posは固定）
                             for dx in shifts:
                                 for dy in shifts:
-                                    trial = dict(cur)
-                                    trial[f"{pos}_dx"] = int(dx)
-                                    trial[f"{pos}_dy"] = int(dy)
+                                    # 一時的に上書き
+                                    cur[f"{pos}_dx"] = int(dx)
+                                    cur[f"{pos}_dy"] = int(dy)
 
-                                    out_rate = eval_out_rate(trial)
+                                    out_rate = eval_out(cur)
+
                                     if out_rate > best_local:
                                         best_local = out_rate
                                         best_dx, best_dy = int(dx), int(dy)
 
-                            # 更新
+                            # 探索が終わったら、見つかった最良値をセット
+                            cur[f"{pos}_dx"] = best_dx
+                            cur[f"{pos}_dy"] = best_dy
+
                             if best_local > best_out:
-                                cur[f"{pos}_dx"] = best_dx
-                                cur[f"{pos}_dy"] = best_dy
                                 best_out = best_local
                                 improved = True
 
@@ -1476,8 +1419,8 @@ else:
                             break
 
                     opt_best_out = best_out
-                    opt_result = cur
-                    opt_delta = opt_best_out - out_normal
+                    opt_result = dict(cur)
+                    opt_delta = opt_best_out - out_normal_eval
 
                     st.write(f"最適Out%（探索）: **{opt_best_out:.3f}**")
                     st.write(f"ΔOut%（最適−通常）: **{opt_delta:+.3f}**")
@@ -1496,73 +1439,83 @@ else:
                     B = st.slider("反復回数（多いほど安定・重くなる）", 20, 200, 60, 10)
                     seed = st.number_input("乱数seed（再現用）", value=0, step=1)
 
-                    xs_all = df_ground["x_math"].to_numpy(dtype=float)
-                    ys_all = df_ground["y_math"].to_numpy(dtype=float)
-                    n_all = xs_all.size
+                    # ★CIは「評価に使っている点群」と同じものを使う（生成点・重みも含む）
+                    xs_ci = np.asarray(xs, dtype=float)
+                    ys_ci = np.asarray(ys, dtype=float)
+                    ws_ci = np.asarray(ws, dtype=float)
+                    n_all = xs_ci.size
 
                     if n_all < 5:
                         st.warning("ゴロ数が少なすぎて信頼区間が安定しません。")
                     else:
-                        # 通常守備の楕円（そのまま）
-                        ell_normal = []
-                        for pos in ["SS", "2B", "3B", "1B"]:
-                            if pos not in rows_by_pos:
-                                continue
-                            ell_normal.append(
-                                make_ellipse_params(pos, rows_by_pos[pos], h_img)
-                            )
+                        # ===== 通常（ゼロシフト）cfg =====
+                        cfg_normal = {}
+                        for pos in rows_by_pos.keys():
+                            cfg_normal[f"{pos}_dx"] = 0.0
+                            cfg_normal[f"{pos}_dy"] = 0.0
 
-                        # 最適シフト適用（SS/2Bだけ動かす。best_cfg固定）
-                        ell_shift = []
-                        for pos in ["SS", "2B", "3B", "1B"]:
-                            if pos not in rows_by_pos:
-                                continue
-
-                            dx_extra = 0.0
-                            dy_extra = 0.0
-                            if opt_result is not None and pos in ["SS", "2B"]:
-                                dx_extra = float(opt_result.get(f"{pos}_dx", 0))
-                                dy_extra = float(opt_result.get(f"{pos}_dy", 0))
-
-                            ell_shift.append(
-                                make_ellipse_params(
-                                    pos,
-                                    rows_by_pos[pos],
-                                    h_img,
-                                    dx_extra=dx_extra,
-                                    dy_extra=dy_extra,
-                                )
-                            )
-
-                        # 元データでの値（best_cfg固定で再計算：表示と整合させる）
-                        out_n0 = out_rate_from_points(xs_all, ys_all, ell_normal)
-                        out_s0 = out_rate_from_points(xs_all, ys_all, ell_shift)
+                        # ===== 点推定（best_cfg固定のΔ）=====
+                        out_n0 = eval_out_rate_prob_points(
+                            xs_ci,
+                            ys_ci,
+                            ws_ci,
+                            rows_by_pos,
+                            cfg_normal,
+                            h_img,
+                            alpha_prob,
+                        )
+                        out_s0 = eval_out_rate_prob_points(
+                            xs_ci,
+                            ys_ci,
+                            ws_ci,
+                            rows_by_pos,
+                            opt_result,
+                            h_img,
+                            alpha_prob,
+                        )
                         delta0 = out_s0 - out_n0
 
+                        # ===== ブートストラップ =====
                         rng = np.random.default_rng(int(seed))
                         deltas = np.empty(B, dtype=float)
 
-                        # ブートストラップ（復元抽出）
                         for i in range(B):
                             idx = rng.integers(0, n_all, size=n_all)
-                            out_n = out_rate_from_points(
-                                xs_all[idx], ys_all[idx], ell_normal
+
+                            xs_b = xs_ci[idx]
+                            ys_b = ys_ci[idx]
+                            ws_b = ws_ci[idx]
+
+                            out_n = eval_out_rate_prob_points(
+                                xs_b,
+                                ys_b,
+                                ws_b,
+                                rows_by_pos,
+                                cfg_normal,
+                                h_img,
+                                alpha_prob,
                             )
-                            out_s = out_rate_from_points(
-                                xs_all[idx], ys_all[idx], ell_shift
+                            out_s = eval_out_rate_prob_points(
+                                xs_b,
+                                ys_b,
+                                ws_b,
+                                rows_by_pos,
+                                opt_result,
+                                h_img,
+                                alpha_prob,
                             )
                             deltas[i] = out_s - out_n
 
                         lo, hi = np.percentile(deltas, [2.5, 97.5])
 
-                        st.write(f"通常 Out%（再計算）: **{out_n0:.3f}**")
-                        st.write(f"シフト Out%（best_cfg固定）: **{out_s0:.3f}**")
+                        st.write(f"通常 Out%（確率）: **{out_n0:.3f}**")
+                        st.write(f"シフト Out%（確率, best_cfg固定）: **{out_s0:.3f}**")
                         st.write(f"ΔOut%（best_cfg固定）: **{delta0:+.3f}**")
                         st.write(
                             f"ΔOut% 95%CI（ブートストラップ）: **[{lo:+.3f}, {hi:+.3f}]**"
                         )
                         st.caption(
-                            "※この信頼区間は『最適化の不確実性』ではなく、『データ有限による不確実性』です（best_cfgは固定）。"
+                            "※このCIは『データ有限による不確実性』です（最適化の不確実性は含みません）。"
                         )
 
     # ……（ここまでで背景・ヒートマップ・通常楕円は描画済み）
