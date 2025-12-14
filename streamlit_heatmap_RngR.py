@@ -138,6 +138,24 @@ def load_main_data():
     return df
 
 
+def show_dist(df_base, col, title=None, topn=30):
+    if col not in df_base.columns:
+        return
+    n = len(df_base)
+    if n == 0:
+        st.caption(f"{title or col}: データ0件")
+        return
+
+    s = df_base[col].astype(str).fillna("NaN")
+    vc = s.value_counts(dropna=False)
+    pct = (vc / n * 100).round(1)
+
+    out = pd.DataFrame({"値": vc.index, "件数": vc.values, "割合(%)": pct.values})
+
+    st.caption(f"{title or col}（フィルタ後 n={n} の中での割合。※ゴロ以外も含む）")
+    st.dataframe(out.head(topn), use_container_width=True)
+
+
 @st.cache_data
 def load_ellipse_tables():
     tables = {}
@@ -497,40 +515,6 @@ def angle_deg_from_home_math(x, y, home_math):
     dx = x - home_math[0]
     dy = y - home_math[1]
     return math.degrees(math.atan2(dy, dx))
-
-
-def generate_ground_xy_filtered(
-    model,
-    cond_dict,
-    home_math,
-    n_samples,
-    seed,
-    w_img,
-    h_img,
-    left_pt_math,
-    right_pt_math,
-    ray_origin_near_math,
-    left_pt_near_math,
-    right_pt_near_math,
-    oversample=4,
-    max_rounds=10,
-):
-    """
-    生成→除外条件で落とす→必要数に満たなければ追加生成、のラッパー
-    """
-    need = int(n_samples)
-    if need <= 0:
-        return None, None, None
-
-    xs, ys = [], []
-    used_key_final = None
-
-    for r in range(max_rounds):
-        n_try = max(need * oversample, 50)
-
-        xg, yg, used_key = generate_ground_xy_from_model(
-            model, cond_dict, home_math, n_samples=n_try, seed=int(seed) + r
-        )
 
 
 def project_points_img(xs_img, ys_img, home, ray_origin, left_pt, right_pt):
@@ -1027,6 +1011,16 @@ if sel_type_group:
     df_f = df_f[df_f["pitch_type_group"].isin(sel_type_group)]
 if sel_lr:
     df_f = df_f[df_f["player_batLR"].astype(str).isin(sel_lr)]
+
+st.subheader("フィルタ後データ内の構成比（ゴロ以外も含む）")
+
+col1, col2 = st.columns(2)
+with col1:
+    show_dist(df_f, "pitch_course", "コース")
+    show_dist(df_f, "pitch_height", "高さ")
+with col2:
+    show_dist(df_f, "pitch_type_group", "球種グループ")
+    show_dist(df_f, "player_batLR", "打者左右")
 
 st.caption(
     f"フィルタ後の打球データ件数：{len(df_f)}（この中からゴロのみ抽出してヒートマップ化します）"
