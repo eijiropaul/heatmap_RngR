@@ -1241,333 +1241,359 @@ else:
         rows_by_pos[pos] = row
         ellipse_params_normal.append(make_ellipse_params(pos, row, h_img))
 
-    if len(rows_by_pos) == 0:
-        st.warning(
-            "守備範囲の選手が未選択です（SS/2B/3B/1Bのいずれかを選んでください）"
+    has_fielders = len(rows_by_pos) > 0
+    if not has_fielders:
+        st.info("守備範囲（SS/2B/3B/1B）を選ぶと、Out%と最適化が表示されます。")
+    else:
+        # ==================================
+        # 評価関数を統一（通常も最適もここを使う）
+        # ==================================
+
+        xs = xs_all
+        ys = ys_all
+        ws = ws_all
+        n = len(xs)
+
+        use_prob = st.checkbox("Out%を確率モデルで評価（中心0.9/縁0.5）", value=True)
+        alpha_prob = st.slider(
+            "確率の鋭さ alpha（大きいほど0/1に近づく）", 0.5, 8.0, 2.2, 0.1
         )
-        st.stop()
 
-    # ==================================
-    # 評価関数を統一（通常も最適もここを使う）
-    # ==================================
+        # 事前計算（確率用）: u,v,c,s は毎回作らない
+        packs_all = {}
+        for pos in ["SS", "2B", "3B", "1B"]:
+            if pos not in rows_by_pos:
+                continue
+            e0 = make_ellipse_params(
+                pos, rows_by_pos[pos], h_img, dx_extra=0, dy_extra=0
+            )
+            u0, v0, c0, s0 = precompute_uv(xs, ys, e0["cx"], e0["cy"], e0["theta"])
+            packs_all[pos] = (e0, u0, v0, c0, s0)
 
-    xs = xs_all
-    ys = ys_all
-    ws = ws_all
-    n = len(xs)
-
-    use_prob = st.checkbox("Out%を確率モデルで評価（中心0.9/縁0.5）", value=True)
-    alpha_prob = st.slider(
-        "確率の鋭さ alpha（大きいほど0/1に近づく）", 0.5, 8.0, 2.2, 0.1
-    )
-
-    # 事前計算（確率用）: u,v,c,s は毎回作らない
-    packs_all = {}
-    for pos in ["SS", "2B", "3B", "1B"]:
-        if pos not in rows_by_pos:
-            continue
-        e0 = make_ellipse_params(pos, rows_by_pos[pos], h_img, dx_extra=0, dy_extra=0)
-        u0, v0, c0, s0 = precompute_uv(xs, ys, e0["cx"], e0["cy"], e0["theta"])
-        packs_all[pos] = (e0, u0, v0, c0, s0)
-
-    def eval_out_rate_prob(cfg):
-        probs_list = []
-        for pos, (e0, u, v, c, s) in packs_all.items():
-            dx = float(cfg.get(f"{pos}_dx", 0.0))
-            dy = float(cfg.get(f"{pos}_dy", 0.0))
-            du, dv = shift_to_du_dv(dx, dy, c, s)
-            p = out_prob_from_uv(u, v, e0["a"], e0["b"], du=du, dv=dv, alpha=alpha_prob)
-            probs_list.append(p)
-
-        p_total = combine_out_probs(probs_list)  # ← n渡す版にしておく
-        return out_rate_weighted_prob(p_total, ws)
-
-    def eval_out_rate_hard(cfg):
-        return eval_out_rate_hard_points(xs, ys, ws, rows_by_pos, cfg, h_img)
-
-    def eval_out(cfg):
-        return eval_out_rate_prob(cfg) if use_prob else eval_out_rate_hard(cfg)
-
-    # =========================
-    # 通常守備 Out%（重み付き）
-    # =========================
-    # ---------------------------
-    # データ点（math座標）
-    # ---------------------------
-    # ここを生成込みに差し替え
-
-    sum_w = ws.sum()
-
-    out_normal = eval_out({})
-    st.write(f"通常守備 Out%（モデル）: **{out_normal:.3f}**")
-    st.write(f"通常守備 BA換算（≒1-Out%）: **{(1-out_normal):.3f}**")
-
-    # 探索設定（軽め）
-
-    do_opt = st.checkbox(
-        "SS・2B・3B・1Bの位置を動かして最適Out%を探す（簡易グリッド探索）", value=False
-    )
-
-    if do_opt:
-        max_shift = st.slider(
-            "探索幅（±px）", min_value=0, max_value=100, value=20, step=5
-        )
-        step = st.slider("刻み（px）", min_value=1, max_value=20, value=10, step=1)
-
-        move_ss = st.checkbox("SSを動かす", value=True)
-        move_2b = st.checkbox("2Bを動かす", value=True)
-        move_3b = st.checkbox("3Bを動かす", value=True)
-        move_1b = st.checkbox("1Bを動かす", value=True)
-
-        move_flags = {"SS": move_ss, "2B": move_2b, "3B": move_3b, "1B": move_1b}
-
-        missing = [
-            p
-            for p in ["SS", "2B", "3B", "1B"]
-            if move_flags.get(p, False) and (p not in rows_by_pos)
-        ]
-        if missing:
-            st.warning(f"探索するポジションの選手が未選択です: {missing}")
-        else:
-
-            if n == 0:
-                st.warning("ゴロデータが0件です。")
-            else:
-                shifts = list(range(-max_shift, max_shift + 1, step))
-
-                # 動かすポジション（選択されている & 選手が選ばれているものだけ）
-                move_positions = []
-                for pos in ["SS", "2B", "3B", "1B"]:
-                    if move_flags.get(pos, False) and (pos in rows_by_pos):
-                        move_positions.append(pos)
-
-                # 1つも動かさないなら終了
-                if len(move_positions) == 0:
-                    st.warning(
-                        "動かすポジションがありません（選手未選択 or チェックOFF）。"
-                    )
-                else:
-                    # ---------------------------
-                    # 固定ポジ（動かさないポジ）のmaskを先に作る
-                    # ---------------------------
-                    fixed_mask = np.zeros(n, dtype=bool)
-
-                    for pos in ["SS", "2B", "3B", "1B"]:
-                        if pos not in rows_by_pos:
-                            continue
-                        if pos in move_positions:
-                            continue  # 動かすので固定には入れない
-
-                        e = make_ellipse_params(
-                            pos, rows_by_pos[pos], h_img, dx_extra=0, dy_extra=0
-                        )
-                        u, v, c, s = precompute_uv(xs, ys, e["cx"], e["cy"], e["theta"])
-                        fixed_mask |= ellipse_mask_from_uv(
-                            u, v, e["a"], e["b"], du=0.0, dv=0.0
-                        )
-
-                    # ---------------------------
-                    # 座標降下：1ポジずつ最適にしていく（軽い）
-                    # ---------------------------
-                    n_iters = st.slider("最適化の反復回数（軽い）", 1, 8, 3, 1)
-
-                    cur0 = {}
-                    for pos in move_positions:
-                        cur0[f"{pos}_dx"] = 0
-                        cur0[f"{pos}_dy"] = 0
-
-                    out_normal_eval = eval_out(cur0)
-                    best_out = eval_out(cur0)
-                    cur = dict(cur0)
-
-                    for it in range(n_iters):
-                        improved = False
-
-                        for pos in move_positions:
-                            best_local = best_out
-                            best_dx = cur[f"{pos}_dx"]
-                            best_dy = cur[f"{pos}_dy"]
-
-                            # このposだけ(dx,dy)を総当たり（他posは固定）
-                            for dx in shifts:
-                                for dy in shifts:
-                                    # 一時的に上書き
-                                    cur[f"{pos}_dx"] = int(dx)
-                                    cur[f"{pos}_dy"] = int(dy)
-
-                                    out_rate = eval_out(cur)
-
-                                    if out_rate > best_local:
-                                        best_local = out_rate
-                                        best_dx, best_dy = int(dx), int(dy)
-
-                            # 探索が終わったら、見つかった最良値をセット
-                            cur[f"{pos}_dx"] = best_dx
-                            cur[f"{pos}_dy"] = best_dy
-
-                            if best_local > best_out:
-                                best_out = best_local
-                                improved = True
-
-                        if not improved:
-                            break
-
-                    opt_best_out = best_out
-                    opt_result = dict(cur)
-                    opt_delta = opt_best_out - out_normal_eval
-
-                    st.write(f"最適Out%（探索）: **{opt_best_out:.3f}**")
-                    st.write(f"ΔOut%（最適−通常）: **{opt_delta:+.3f}**")
-                    st.caption(f"最適シフト（追加移動量, px）: {opt_result}")
-
-                # =========================
-                # ΔOut% の不確実性（軽量ブートストラップ：best_cfg固定）
-                # =========================
-                st.subheader("ΔOut% の不確実性（ブートストラップ）※軽量版")
-
-                do_ci = st.checkbox(
-                    "ΔOut%の信頼区間を出す（best_cfg固定）", value=False
+        def eval_out_rate_prob(cfg):
+            probs_list = []
+            for pos, (e0, u, v, c, s) in packs_all.items():
+                dx = float(cfg.get(f"{pos}_dx", 0.0))
+                dy = float(cfg.get(f"{pos}_dy", 0.0))
+                du, dv = shift_to_du_dv(dx, dy, c, s)
+                p = out_prob_from_uv(
+                    u, v, e0["a"], e0["b"], du=du, dv=dv, alpha=alpha_prob
                 )
+                probs_list.append(p)
 
-                if do_ci:
-                    B = st.slider("反復回数（多いほど安定・重くなる）", 20, 200, 60, 10)
-                    seed = st.number_input("乱数seed（再現用）", value=0, step=1)
+            p_total = combine_out_probs(probs_list)  # ← n渡す版にしておく
+            return out_rate_weighted_prob(p_total, ws)
 
-                    # ★CIは「評価に使っている点群」と同じものを使う（生成点・重みも含む）
-                    xs_ci = np.asarray(xs, dtype=float)
-                    ys_ci = np.asarray(ys, dtype=float)
-                    ws_ci = np.asarray(ws, dtype=float)
-                    n_all = xs_ci.size
+        def eval_out_rate_hard(cfg):
+            return eval_out_rate_hard_points(xs, ys, ws, rows_by_pos, cfg, h_img)
 
-                    if n_all < 5:
-                        st.warning("ゴロ数が少なすぎて信頼区間が安定しません。")
+        def eval_out(cfg):
+            return eval_out_rate_prob(cfg) if use_prob else eval_out_rate_hard(cfg)
+
+        # =========================
+        # 通常守備 Out%（重み付き）
+        # =========================
+        # ---------------------------
+        # データ点（math座標）
+        # ---------------------------
+        # ここを生成込みに差し替え
+
+        sum_w = ws.sum()
+
+        out_normal = eval_out({})
+        st.write(f"通常守備 Out%（モデル）: **{out_normal:.3f}**")
+        st.write(f"通常守備 BA換算（≒1-Out%）: **{(1-out_normal):.3f}**")
+
+        # 探索設定（軽め）
+
+        do_opt = st.checkbox(
+            "SS・2B・3B・1Bの位置を動かして最適Out%を探す（簡易グリッド探索）",
+            value=False,
+        )
+
+        if do_opt:
+            max_shift = st.slider(
+                "探索幅（±px）", min_value=0, max_value=100, value=20, step=5
+            )
+            step = st.slider("刻み（px）", min_value=1, max_value=20, value=10, step=1)
+
+            move_ss = st.checkbox("SSを動かす", value=True)
+            move_2b = st.checkbox("2Bを動かす", value=True)
+            move_3b = st.checkbox("3Bを動かす", value=True)
+            move_1b = st.checkbox("1Bを動かす", value=True)
+
+            move_flags = {"SS": move_ss, "2B": move_2b, "3B": move_3b, "1B": move_1b}
+
+            missing = [
+                p
+                for p in ["SS", "2B", "3B", "1B"]
+                if move_flags.get(p, False) and (p not in rows_by_pos)
+            ]
+            if missing:
+                st.warning(f"探索するポジションの選手が未選択です: {missing}")
+            else:
+
+                if n == 0:
+                    st.warning("ゴロデータが0件です。")
+                else:
+                    shifts = list(range(-max_shift, max_shift + 1, step))
+
+                    # 動かすポジション（選択されている & 選手が選ばれているものだけ）
+                    move_positions = []
+                    for pos in ["SS", "2B", "3B", "1B"]:
+                        if move_flags.get(pos, False) and (pos in rows_by_pos):
+                            move_positions.append(pos)
+
+                    # 1つも動かさないなら終了
+                    if len(move_positions) == 0:
+                        st.warning(
+                            "動かすポジションがありません（選手未選択 or チェックOFF）。"
+                        )
                     else:
-                        # ===== 通常（ゼロシフト）cfg =====
-                        cfg_normal = {}
-                        for pos in rows_by_pos.keys():
-                            cfg_normal[f"{pos}_dx"] = 0.0
-                            cfg_normal[f"{pos}_dy"] = 0.0
+                        # ---------------------------
+                        # 固定ポジ（動かさないポジ）のmaskを先に作る
+                        # ---------------------------
+                        fixed_mask = np.zeros(n, dtype=bool)
 
-                        # ===== 点推定（best_cfg固定のΔ）=====
-                        out_n0 = eval_out_rate_prob_points(
-                            xs_ci,
-                            ys_ci,
-                            ws_ci,
-                            rows_by_pos,
-                            cfg_normal,
-                            h_img,
-                            alpha_prob,
+                        for pos in ["SS", "2B", "3B", "1B"]:
+                            if pos not in rows_by_pos:
+                                continue
+                            if pos in move_positions:
+                                continue  # 動かすので固定には入れない
+
+                            e = make_ellipse_params(
+                                pos, rows_by_pos[pos], h_img, dx_extra=0, dy_extra=0
+                            )
+                            u, v, c, s = precompute_uv(
+                                xs, ys, e["cx"], e["cy"], e["theta"]
+                            )
+                            fixed_mask |= ellipse_mask_from_uv(
+                                u, v, e["a"], e["b"], du=0.0, dv=0.0
+                            )
+
+                        # ---------------------------
+                        # 座標降下：1ポジずつ最適にしていく（軽い）
+                        # ---------------------------
+                        n_iters = st.slider("最適化の反復回数（軽い）", 1, 8, 3, 1)
+
+                        cur0 = {}
+                        for pos in move_positions:
+                            cur0[f"{pos}_dx"] = 0
+                            cur0[f"{pos}_dy"] = 0
+
+                        out_normal_eval = eval_out(cur0)
+                        best_out = eval_out(cur0)
+                        cur = dict(cur0)
+
+                        for it in range(n_iters):
+                            improved = False
+
+                            for pos in move_positions:
+                                best_local = best_out
+                                best_dx = cur[f"{pos}_dx"]
+                                best_dy = cur[f"{pos}_dy"]
+
+                                # このposだけ(dx,dy)を総当たり（他posは固定）
+                                for dx in shifts:
+                                    for dy in shifts:
+                                        # 一時的に上書き
+                                        cur[f"{pos}_dx"] = int(dx)
+                                        cur[f"{pos}_dy"] = int(dy)
+
+                                        out_rate = eval_out(cur)
+
+                                        if out_rate > best_local:
+                                            best_local = out_rate
+                                            best_dx, best_dy = int(dx), int(dy)
+
+                                # 探索が終わったら、見つかった最良値をセット
+                                cur[f"{pos}_dx"] = best_dx
+                                cur[f"{pos}_dy"] = best_dy
+
+                                if best_local > best_out:
+                                    best_out = best_local
+                                    improved = True
+
+                            if not improved:
+                                break
+
+                        opt_best_out = best_out
+                        opt_result = dict(cur)
+                        opt_delta = opt_best_out - out_normal_eval
+
+                        st.write(f"最適Out%（探索）: **{opt_best_out:.3f}**")
+                        st.write(f"ΔOut%（最適−通常）: **{opt_delta:+.3f}**")
+                        st.caption(f"最適シフト（追加移動量, px）: {opt_result}")
+
+                    # =========================
+                    # ΔOut% の不確実性（軽量ブートストラップ：best_cfg固定）
+                    # =========================
+                    st.subheader("ΔOut% の不確実性（ブートストラップ）※軽量版")
+
+                    do_ci = st.checkbox(
+                        "ΔOut%の信頼区間を出す（best_cfg固定）", value=False
+                    )
+
+                    if do_ci:
+                        B = st.slider(
+                            "反復回数（多いほど安定・重くなる）", 20, 400, 100, 10
                         )
-                        out_s0 = eval_out_rate_prob_points(
-                            xs_ci,
-                            ys_ci,
-                            ws_ci,
-                            rows_by_pos,
-                            opt_result,
-                            h_img,
-                            alpha_prob,
-                        )
-                        delta0 = out_s0 - out_n0
+                        seed = st.number_input("乱数seed（再現用）", value=0, step=1)
 
-                        # ===== ブートストラップ =====
-                        rng = np.random.default_rng(int(seed))
-                        deltas = np.empty(B, dtype=float)
+                        # ★CIは「評価に使っている点群」と同じものを使う（生成点・重みも含む）
+                        xs_ci = np.asarray(xs, dtype=float)
+                        ys_ci = np.asarray(ys, dtype=float)
+                        ws_ci = np.asarray(ws, dtype=float)
+                        n_all = xs_ci.size
 
-                        for i in range(B):
-                            idx = rng.integers(0, n_all, size=n_all)
+                        if (opt_result is None) or (len(opt_result) == 0):
+                            st.warning(
+                                "最適配置(opt_result)が未計算です。先に探索(do_opt)をONにしてください。"
+                            )
+                        elif n_all < 5:
+                            st.warning("ゴロ数が少なすぎて信頼区間が安定しません。")
+                        else:
+                            # ===== 通常（ゼロシフト）cfg =====
+                            cfg_normal = {}
+                            for pos in rows_by_pos.keys():
+                                cfg_normal[f"{pos}_dx"] = 0.0
+                                cfg_normal[f"{pos}_dy"] = 0.0
 
-                            xs_b = xs_ci[idx]
-                            ys_b = ys_ci[idx]
-                            ws_b = ws_ci[idx]
-
-                            out_n = eval_out_rate_prob_points(
-                                xs_b,
-                                ys_b,
-                                ws_b,
+                            # ===== 点推定（同じ点群上で）=====
+                            out_n0 = eval_out_rate_prob_points(
+                                xs_ci,
+                                ys_ci,
+                                ws_ci,
                                 rows_by_pos,
                                 cfg_normal,
                                 h_img,
                                 alpha_prob,
                             )
-                            out_s = eval_out_rate_prob_points(
-                                xs_b,
-                                ys_b,
-                                ws_b,
+                            out_s0 = eval_out_rate_prob_points(
+                                xs_ci,
+                                ys_ci,
+                                ws_ci,
                                 rows_by_pos,
                                 opt_result,
                                 h_img,
                                 alpha_prob,
                             )
-                            deltas[i] = out_s - out_n
+                            delta0 = out_s0 - out_n0
 
-                        lo, hi = np.percentile(deltas, [2.5, 97.5])
+                            # ===== paired bootstrap（同じidxで通常とシフトを両方評価）=====
+                            rng = np.random.default_rng(int(seed))
+                            deltas = np.empty(B, dtype=float)
+                            outs_n = np.empty(B, dtype=float)
+                            outs_s = np.empty(B, dtype=float)
 
-                        st.write(f"通常 Out%（確率）: **{out_n0:.3f}**")
-                        st.write(f"シフト Out%（確率, best_cfg固定）: **{out_s0:.3f}**")
-                        st.write(f"ΔOut%（best_cfg固定）: **{delta0:+.3f}**")
-                        st.write(
-                            f"ΔOut% 95%CI（ブートストラップ）: **[{lo:+.3f}, {hi:+.3f}]**"
-                        )
-                        st.caption(
-                            "※このCIは『データ有限による不確実性』です（最適化の不確実性は含みません）。"
-                        )
+                            for i in range(B):
+                                idx = rng.integers(0, n_all, size=n_all)
 
-    # ……（ここまでで背景・ヒートマップ・通常楕円は描画済み）
+                                xs_b = xs_ci[idx]
+                                ys_b = ys_ci[idx]
+                                ws_b = ws_ci[idx]
 
-    # =========================
-    # 最適配置のオーバーレイ（探索したときだけ）
-    # =========================
-    show_opt = st.checkbox("最適配置（探索結果）を図に重ねる", value=True)
+                                out_n = eval_out_rate_prob_points(
+                                    xs_b,
+                                    ys_b,
+                                    ws_b,
+                                    rows_by_pos,
+                                    cfg_normal,
+                                    h_img,
+                                    alpha_prob,
+                                )
+                                out_s = eval_out_rate_prob_points(
+                                    xs_b,
+                                    ys_b,
+                                    ws_b,
+                                    rows_by_pos,
+                                    opt_result,
+                                    h_img,
+                                    alpha_prob,
+                                )
 
-    if show_opt and (opt_result is not None):
-        for pos in ["SS", "2B", "3B", "1B"]:
-            pick = selected_player[pos]
-            if pick == "（表示しない）":
-                continue
-            if f"{pos}_dx" not in opt_result:
-                continue
+                                outs_n[i] = out_n
+                                outs_s[i] = out_s
+                                deltas[i] = out_s - out_n
 
-            t = ellipse_tables[pos]
-            row = t[t["NAME"].astype(str) == pick].iloc[0]
+                            lo, hi = np.percentile(deltas, [2.5, 97.5])
+                            n_lo, n_hi = np.percentile(outs_n, [2.5, 97.5])
+                            s_lo, s_hi = np.percentile(outs_s, [2.5, 97.5])
 
-            dx = float(opt_result.get(f"{pos}_dx", 0))
-            dy = float(opt_result.get(f"{pos}_dy", 0))
+                            st.write(f"通常 Out%（確率, 点推定）: **{out_n0:.3f}**")
+                            st.write(f"シフト Out%（確率, 点推定）: **{out_s0:.3f}**")
+                            st.write(f"ΔOut%（点推定）: **{delta0:+.3f}**")
 
-            # 最適位置の点
-            base_x_img, base_y_img = infield_positions_img[pos]
-            cx_img = base_x_img + float(row["center_x"]) + dx
-            cy_img = base_y_img + float(row["center_y"]) + dy
-            cx = cx_img
-            cy = h_img - cy_img
-            ax.scatter(cx, cy, s=140, marker="x")
+                            st.write(
+                                f"通常 Out% 95%CI（bootstrap）: **[{n_lo:.3f}, {n_hi:.3f}]**"
+                            )
+                            st.write(
+                                f"シフト Out% 95%CI（bootstrap）: **[{s_lo:.3f}, {s_hi:.3f}]**"
+                            )
+                            st.write(
+                                f"ΔOut% 95%CI（paired bootstrap）: **[{lo:+.3f}, {hi:+.3f}]**"
+                            )
 
-            # 破線の楕円
-            add_ellipse(
-                ax,
-                pos,
-                row,
-                h_img,
-                dx_extra=dx,
-                dy_extra=dy,
-                linewidth=3,
-                linestyle="--",
+                            st.caption(
+                                "※paired bootstrap：同じ再標本サンプル上で通常とシフトを比較するので、差(Δ)の解釈が自然になります。"
+                            )
+
+        # ……（ここまでで背景・ヒートマップ・通常楕円は描画済み）
+
+        # =========================
+        # 最適配置のオーバーレイ（探索したときだけ）
+        # =========================
+        show_opt = st.checkbox("最適配置（探索結果）を図に重ねる", value=True)
+
+        if show_opt and (opt_result is not None):
+            for pos in ["SS", "2B", "3B", "1B"]:
+                pick = selected_player[pos]
+                if pick == "（表示しない）":
+                    continue
+                if f"{pos}_dx" not in opt_result:
+                    continue
+
+                t = ellipse_tables[pos]
+                row = t[t["NAME"].astype(str) == pick].iloc[0]
+
+                dx = float(opt_result.get(f"{pos}_dx", 0))
+                dy = float(opt_result.get(f"{pos}_dy", 0))
+
+                # 最適位置の点
+                base_x_img, base_y_img = infield_positions_img[pos]
+                cx_img = base_x_img + float(row["center_x"]) + dx
+                cy_img = base_y_img + float(row["center_y"]) + dy
+                cx = cx_img
+                cy = h_img - cy_img
+                ax.scatter(cx, cy, s=140, marker="x")
+
+                # 破線の楕円
+                add_ellipse(
+                    ax,
+                    pos,
+                    row,
+                    h_img,
+                    dx_extra=dx,
+                    dy_extra=dy,
+                    linewidth=3,
+                    linestyle="--",
+                )
+
+            ax.text(
+                0.02,
+                0.98,
+                f"Best Out%={opt_best_out:.3f}, ΔOut%={opt_delta:+.3f}",
+                transform=ax.transAxes,
+                fontsize=10,
+                va="top",
             )
 
-        ax.text(
-            0.02,
-            0.98,
-            f"Best Out%={opt_best_out:.3f}, ΔOut%={opt_delta:+.3f}",
-            transform=ax.transAxes,
-            fontsize=10,
-            va="top",
-        )
+# ★ axis設定は毎回同じに固定（ここで統一）
+ax.set_xlim(0, w_img)
+ax.set_ylim(0, h_img)
 
-    # ★ axis設定は毎回同じに固定（ここで統一）
-    ax.set_xlim(0, w_img)
-    ax.set_ylim(0, h_img)
+ax.set_aspect("equal", adjustable="box")
 
-    ax.set_aspect("equal", adjustable="box")
-
-    # ★表示は最後に1回だけ
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+# ★表示は最後に1回だけ
+st.pyplot(fig, use_container_width=True)
+plt.close(fig)
