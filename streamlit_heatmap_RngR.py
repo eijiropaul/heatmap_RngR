@@ -34,11 +34,11 @@ Y_BINS = 80
 
 # 元画像座標（あなたのコードと同じ）
 home = (633.0, 1071.0)
-ray_origin = (633.0, 428.0)
+ray_origin = (633.0, 477.0)
 ray_origin_near = (633.0, 737.0)
-left_pt = (240.0, 682.0)
+left_pt = (273.0, 713.0)
 left_pt_near = (466.0, 904.0)
-right_pt = (1033.0, 682.0)
+right_pt = (993.0, 713.0)
 right_pt_near = (800.0, 904.0)
 
 # 初期守備位置（画像座標：y下向き）
@@ -115,6 +115,7 @@ def load_main_data():
         "pitch_height",
         "pitch_type",
         "player_batLR",
+        "runners",
     ]:
         if c in df.columns:
             df[c] = df[c].astype(str)
@@ -981,6 +982,7 @@ sel_type_group = st.multiselect(
     default=[],
 )
 sel_lr = multiselect_filter("player_batLR（打者左右）", "player_batLR")
+sel_runners = multiselect_filter("runners（塁状況）", "runners")
 
 # ★ 追加：投影ON/OFF
 use_projection = st.checkbox(
@@ -1011,6 +1013,8 @@ if sel_type_group:
     df_f = df_f[df_f["pitch_type_group"].isin(sel_type_group)]
 if sel_lr:
     df_f = df_f[df_f["player_batLR"].astype(str).isin(sel_lr)]
+if sel_runners:
+    df_f = df_f[df_f["runners"].astype(str).isin(sel_runners)]
 
 st.subheader("フィルタ後データ内の構成比（ゴロ以外も含む）")
 
@@ -1021,6 +1025,7 @@ with col1:
 with col2:
     show_dist(df_f, "pitch_type_group", "球種グループ")
     show_dist(df_f, "player_batLR", "打者左右")
+    show_dist(df_f, "runners", "塁状況")
 
 st.caption(
     f"フィルタ後の打球データ件数：{len(df_f)}（この中からゴロのみ抽出してヒートマップ化します）"
@@ -1063,6 +1068,7 @@ feat_cols = [
     "pitch_height",
     "pitch_type_group",
     "player_batLR",
+    "runners",
 ]
 
 df_ground_train = build_training_ground(
