@@ -1198,6 +1198,7 @@ else:
                 "pitch_height": pick_one_or_blank(sel_height),
                 "pitch_type_group": pick_one_or_blank(sel_type_group),
                 "player_batLR": pick_one_or_blank(sel_lr),
+                "runners": pick_one_or_blank(sel_runners),
             }
             x_plot_gen, y_plot_gen, _ = generate_ground_xy_from_model(
                 model, cond_dict, home_math, n_samples=n_gen, seed=gen_seed
@@ -1279,8 +1280,12 @@ else:
         def eval_out_rate_prob(cfg):
             probs_list = []
             for pos, (e0, u, v, c, s) in packs_all.items():
-                dx = float(cfg.get(f"{pos}_dx", 0.0))
-                dy = float(cfg.get(f"{pos}_dy", 0.0))
+                dx_img = float(cfg.get(f"{pos}_dx", 0.0))
+                dy_img = float(cfg.get(f"{pos}_dy", 0.0))
+
+                dx = dx_img
+                dy = -dy_img  # math座標系なので符号反転
+
                 du, dv = shift_to_du_dv(dx, dy, c, s)
                 p = out_prob_from_uv(
                     u, v, e0["a"], e0["b"], du=du, dv=dv, alpha=alpha_prob
@@ -1522,13 +1527,23 @@ else:
                                 outs_s[i] = out_s
                                 deltas[i] = out_s - out_n
 
+                            out_n_boot_mean = float(outs_n.mean())
+                            out_s_boot_mean = float(outs_s.mean())
+                            delta_boot_mean = float(deltas.mean())
+
                             lo, hi = np.percentile(deltas, [2.5, 97.5])
                             n_lo, n_hi = np.percentile(outs_n, [2.5, 97.5])
                             s_lo, s_hi = np.percentile(outs_s, [2.5, 97.5])
 
-                            st.write(f"通常 Out%（確率, 点推定）: **{out_n0:.3f}**")
-                            st.write(f"シフト Out%（確率, 点推定）: **{out_s0:.3f}**")
-                            st.write(f"ΔOut%（点推定）: **{delta0:+.3f}**")
+                            st.write(
+                                f"通常 Out%（bootstrap平均）: **{out_n_boot_mean:.3f}**"
+                            )
+                            st.write(
+                                f"シフト Out%（bootstrap平均）: **{out_s_boot_mean:.3f}**"
+                            )
+                            st.write(
+                                f"ΔOut%（bootstrap平均）: **{delta_boot_mean:+.3f}**"
+                            )
 
                             st.write(
                                 f"通常 Out% 95%CI（bootstrap）: **[{n_lo:.3f}, {n_hi:.3f}]**"
